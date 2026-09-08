@@ -204,14 +204,23 @@ def _update_claim(
 class _Evaluation:
     """Mutable working set of one policy evaluation (kept private)."""
 
-    def __init__(self, me: Overlay, knowledge: TypeKnowledge, base_addresses: set[str]) -> None:
+    def __init__(
+        self,
+        me: Overlay,
+        knowledge: TypeKnowledge,
+        base_addresses: set[str],
+        trunk_drift: dict[str, list[str]] | None = None,
+    ) -> None:
         self.me = me
         self.knowledge = knowledge
         self.base_addresses = base_addresses
+        self.trunk_drift: dict[str, list[str]] = dict(trunk_drift or {})
         self.claims: dict[str, Claim] = dict(me.claims)
         self.own: set[str] = set(me.create_claims())
         self.violations: list[Violation] = []
         self.warnings: list[str] = []
+        self.drift: list[str] = []
+        self.ignored: list[str] = []
         self.now = utcnow_iso()
 
     # -- classification ---------------------------------------------------- #
@@ -291,14 +300,29 @@ class _Evaluation:
 
     def _visit_update(self, change: ResourceChange) -> None:
         if self.is_base(change.address):
-            existing = self.claims.get(change.address)
-            self.claims[change.address] = _update_claim(change, self.knowledge, existing, self.now)
+            self._visit_base_update(change)
             return
         if not self.is_own(change.address):
             self.warnings.append(
                 f"{change.address}: not in the base state and not claimed; treated as "
                 "created by this overlay (run apply to re-register the claim)"
             )
+
+    def _visit_base_update(self, change: ResourceChange) -> None:
+        """Ignored-attributes rule (§7.7), then trunk drift (§7.8), then the update claim."""
+        existing = self.claims.get(change.address)
+        if existing is not None and existing.kind is ClaimKind.UPDATE:
+            # Already claimed by this overlay: the update is its own, whatever the trunk does.
+            self.claims[change.address] = _update_claim(change, self.knowledge, existing, self.now)
+            return
+        differing = _differing_attributes(change)
+        if differing and differing <= self.knowledge.ignored_attrs(change.type):
+            self.ignored.append(change.address)
+            return
+        if change.address in self.trunk_drift:
+            self.drift.append(change.address)
+            return
+        self.claims[change.address] = _update_claim(change, self.knowledge, None, self.now)
 
     def _visit_destructive(self, change: ResourceChange, actions: tuple[str, ...]) -> None:
         if not self.is_own(change.address):
@@ -325,6 +349,20 @@ class _Evaluation:
             self.warnings.append(warning)
 
     # -- global checks ----------------------------------------------------- #
+
+    def summarise_noise(self) -> None:
+        """One warning each for ignored-attribute updates and trunk drift (§7.7, §7.8)."""
+        if self.ignored:
+            self.warnings.append(
+                f"{len(self.ignored)} update(s) only touch environment-dependent attributes "
+                f"({', '.join(sorted(self.ignored))}): not claimed, still applied by tofu"
+            )
+        if self.drift:
+            self.warnings.append(
+                f"{len(self.drift)} base resource(s) differ because the trunk is not applied "
+                f"on this base ({', '.join(sorted(self.drift))}): run the trunk pipeline, "
+                "then `rebase`, or pass --accept-drift to claim them"
+            )
 
     def check_base_identities(self, base_identities: set[str]) -> None:
         """Check 5: a create whose identity already exists in the base state."""
@@ -368,19 +406,35 @@ def evaluate(
     doc: RegistryDoc,
     knowledge: TypeKnowledge,
     registry: Registry,
+    trunk_drift: dict[str, list[str]] | None = None,
 ) -> PolicyResult:
-    """Run DESIGN §7 checks 2-6 on a plan and build the claims to acquire on apply.
+    """Run DESIGN §7 checks 2-8 on a plan and build the claims to acquire on apply.
 
     Existing claims of ``me`` are kept (refreshed when the plan touches their
     address); claims of own resources deleted by the plan are dropped.
+
+    ``trunk_drift`` is the trunk baseline (address -> actions of a plan of the
+    trunk config against the base state). An ``update`` on a base address is
+    first tested against the ignored-attributes rule (§7.7: no claim, listed
+    in ``ignored``), then against ``trunk_drift`` (§7.8: no claim, listed in
+    ``drift``), and only then becomes an ``update`` claim. An address already
+    under an ``update`` claim of ``me`` stays claimed. ``None`` means "no
+    baseline available": nothing is classified as drift.
     """
-    ev = _Evaluation(me, knowledge, base_addresses)
+    ev = _Evaluation(me, knowledge, base_addresses, trunk_drift)
     for change in changes:
         ev.visit(change)
+    ev.summarise_noise()
     ev.violations.extend(registry.conflicts_for(doc, me.name, ev.claims))
     ev.check_base_identities(base_identities)
     ev.check_drift(drift)
-    return PolicyResult(violations=ev.violations, warnings=ev.warnings, claims=ev.claims)
+    return PolicyResult(
+        violations=ev.violations,
+        warnings=ev.warnings,
+        claims=ev.claims,
+        drift=sorted(ev.drift),
+        ignored=sorted(ev.ignored),
+    )
 
 
 # --------------------------------------------------------------- merge verify

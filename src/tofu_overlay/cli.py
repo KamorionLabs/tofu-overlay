@@ -324,6 +324,8 @@ def plan(
                 "summary": summary_dict,
                 "planfile": str(planfile),
                 "stale": stale,
+                "drift": list(policy.drift),
+                "ignored": list(policy.ignored),
                 "remote_overlays": svc.remote_overlay_keys(svc.name),
             },
             lambda: None,
@@ -339,6 +341,13 @@ def apply(
     auto_approve: Annotated[bool, typer.Option("--auto-approve")] = False,
     allow_stale: Annotated[bool, typer.Option("--allow-stale")] = False,
     allow_behind: Annotated[bool, typer.Option("--allow-behind")] = False,
+    accept_drift: Annotated[
+        bool,
+        typer.Option(
+            "--accept-drift",
+            help="Claim base updates that are trunk drift (needs --yes in CI).",
+        ),
+    ] = False,
     tofu_args: Annotated[list[str] | None, typer.Argument(metavar="[-- TOFU_ARGS...]")] = None,
 ) -> None:
     """Acquire claims and apply the plan on the overlay state."""
@@ -347,6 +356,8 @@ def apply(
         setup = _setup(ctx, mutating=True)
         if auto_approve and not (config.is_ci() or setup.g.yes):
             raise PolicyError("--auto-approve requires --yes outside CI")
+        if accept_drift and config.is_ci() and not setup.g.yes:
+            raise PolicyError("--accept-drift requires --yes in CI")
         svc = setup.service()
         ov = svc.apply(
             auto_approve=auto_approve,
@@ -354,6 +365,7 @@ def apply(
             allow_behind=allow_behind,
             extra=list(tofu_args or []),
             yes=setup.g.yes,
+            accept_drift=accept_drift,
         )
         _emit(
             setup,

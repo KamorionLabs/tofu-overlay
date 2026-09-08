@@ -219,3 +219,29 @@ class TestRemoteHelpers:
         git("checkout", "-q", "-b", "feature/ABC-12-reports", cwd=repo)
         git("push", "-q", "-u", "origin", "feature/ABC-12-reports", cwd=repo)
         assert config.remote_branch_exists(repo, "feature/ABC-12-reports") is True
+
+
+class TestIgnoredAttributesConfig:
+    def test_top_level_section(self, git_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TOFU_OVERLAY_BINARY", raising=False)
+        (git_repo / ".tofu-overlay.yaml").write_text(
+            "ignored_attributes:\n  acme_widget: [stamp]\n", encoding="utf-8"
+        )
+        assert config.load_config(git_repo).ignored_attributes == {"acme_widget": ["stamp"]}
+
+    def test_lifted_from_import_ids_layout(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TOFU_OVERLAY_BINARY", raising=False)
+        (git_repo / ".tofu-overlay.yaml").write_text(
+            "ignored_attributes:\n  acme_widget: [stamp]\n"
+            "import_ids:\n  formats:\n    acme_widget: '{name}'\n"
+            "  ignored_attributes:\n    acme_other: [when]\n",
+            encoding="utf-8",
+        )
+        cfg = config.load_config(git_repo)
+        assert cfg.import_ids == {"acme_widget": "{name}"}
+        assert cfg.ignored_attributes == {"acme_widget": ["stamp"], "acme_other": ["when"]}
+
+    def test_default_is_empty(self) -> None:
+        assert ToolConfig().ignored_attributes == {}

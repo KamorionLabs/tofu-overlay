@@ -361,3 +361,30 @@ class TestOverrides:
             "name": "iam-acme-dev-app"
         }
         assert overridden.import_id_for("aws_iam_role_policy", {"role": "r", "name": "n"}) == "r:n"
+
+
+class TestIgnoredAttributes:
+    def test_packaged_defaults(self, knowledge: TypeKnowledge) -> None:
+        assert {"filename", "last_modified"} <= knowledge.ignored_attrs("aws_lambda_function")
+        assert "filename" in knowledge.ignored_attrs("aws_lambda_layer_version")
+        assert "output_path" in knowledge.ignored_attrs("archive_file")
+
+    def test_wildcard_applies_to_every_type(self, knowledge: TypeKnowledge) -> None:
+        assert knowledge.ignored_attrs("aws_s3_bucket") == {"last_modified"}
+        assert knowledge.ignored_attrs("acme_widget") == {"last_modified"}
+        assert "filename" not in knowledge.ignored_attrs("aws_s3_bucket")
+
+    def test_user_entries_are_unioned(self) -> None:
+        cfg = ToolConfig(
+            policy=PolicyConfig(),
+            ignored_attributes={"aws_lambda_function": ["s3_key"], "acme_widget": ["stamp"]},
+        )
+        knowledge = TypeKnowledge.load(cfg)
+        assert {"filename", "last_modified", "s3_key"} <= knowledge.ignored_attrs(
+            "aws_lambda_function"
+        )
+        assert knowledge.ignored_attrs("acme_widget") == {"last_modified", "stamp"}
+
+    def test_constructor_default_is_empty(self) -> None:
+        knowledge = TypeKnowledge({}, {}, [], [], {})
+        assert knowledge.ignored_attrs("aws_lambda_function") == set()

@@ -113,7 +113,13 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-_IMPORT_IDS_SECTIONS = ("non_importable", "replace_prone", "virtual_attributes")
+_IMPORT_IDS_SECTIONS = (
+    "non_importable",
+    "replace_prone",
+    "virtual_attributes",
+    "ignored_attributes",
+)
+_IMPORT_IDS_MAP_SECTIONS = ("virtual_attributes", "ignored_attributes")
 
 
 def _normalise_raw(data: dict[str, Any]) -> dict[str, Any]:
@@ -133,7 +139,7 @@ def _normalise_raw(data: dict[str, Any]) -> dict[str, Any]:
     for section in _IMPORT_IDS_SECTIONS:
         if section in lifted:
             value = lifted.pop(section)
-            if section == "virtual_attributes":
+            if section in _IMPORT_IDS_MAP_SECTIONS:
                 merged = dict(raw.get(section) or {})
                 merged.update(value or {})
                 raw[section] = merged

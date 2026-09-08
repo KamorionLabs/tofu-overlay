@@ -65,6 +65,17 @@ virtual_attributes:
   acme_widget: [apply_immediately]
   aws_lambda_function: [filename, source_code_hash, publish, skip_destroy]
 
+# Environment-dependent attributes: their value depends on where tofu runs
+# (a local path under TF_DATA_DIR, a timestamp), not on the configuration. An
+# overlay `update` on a base resource that only changes these attributes is
+# not a branch change: it is not claimed (and still applied by tofu). Keys
+# are type globs, "*" applies to every type. Merged over the packaged list
+# (aws_lambda_function: [filename, last_modified], aws_lambda_layer_version:
+# [filename], archive_file: [output_path], "*": [last_modified]).
+ignored_attributes:
+  acme_widget: [generated_at]
+  aws_lambda_function: [s3_key]
+
 # Resource types that cannot be handed to the trunk by `import {}` blocks.
 # `merge` lists them and refuses unless --accept-recreate names the address.
 # Glob patterns are accepted ("random_*"). Added to the packaged list.

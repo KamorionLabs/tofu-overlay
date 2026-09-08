@@ -22,12 +22,14 @@ from typing import Any
 from tofu_overlay import __version__, config
 from tofu_overlay import plan as planmod
 from tofu_overlay import state as statemod
+from tofu_overlay import trunk as trunkmod
 from tofu_overlay.backend import parse_remote_state_refs, resolve_backend
 from tofu_overlay.identity import TypeKnowledge
 from tofu_overlay.models import (
     BackendConfig,
     Claim,
     ClaimKind,
+    DriftError,
     FrozenError,
     NotAllowedError,
     Overlay,
@@ -54,6 +56,9 @@ from tofu_overlay.tofu import TofuRunner, validate_passthrough
 DATA_DIR_NAME = ".tofu-overlay"
 BASE_DIR_NAME = "_base"
 BASE_CACHE_FILE = "base_addresses.json"
+TRUNK_DIR_NAME = "_trunk"
+TRUNK_DATA_DIR_NAME = "_trunk-data"
+TRUNK_BASELINE_FILE = "trunk_baseline.json"
 IMPORTS_GLOB = "zz_overlay_*.imports.tf"
 PLAN_GLOB = "tfplan.*"
 NAME_VAR = "TF_VAR_tofu_overlay_name"
@@ -212,6 +217,16 @@ class OverlayService:
     def base_data_dir(self) -> Path:
         """TF_DATA_DIR used for read-only operations on the base."""
         return self.cwd / DATA_DIR_NAME / BASE_DIR_NAME
+
+    @property
+    def trunk_cache_dir(self) -> Path:
+        """Cache of exported trunk trees (``.tofu-overlay/_trunk/<sha>/``, latest sha only)."""
+        return self.cwd / DATA_DIR_NAME / TRUNK_DIR_NAME
+
+    @property
+    def trunk_data_dir(self) -> Path:
+        """TF_DATA_DIR of the trunk baseline plan (base key, read-only use)."""
+        return self.cwd / DATA_DIR_NAME / TRUNK_DATA_DIR_NAME
 
     @property
     def overlay_key(self) -> str:
@@ -637,6 +652,105 @@ class OverlayService:
         """Identity keys of the base state, cached alongside the addresses."""
         return set(self._base_cache(refresh)["identities"])
 
+    # ------------------------------------------------------------------ trunk baseline
+
+    def _trunk_baseline_path(self) -> Path:
+        return self.base_data_dir / TRUNK_BASELINE_FILE
+
+    def _read_trunk_baseline(self, sha: str, etag: str | None) -> dict[str, list[str]] | None:
+        path = self._trunk_baseline_path()
+        if not path.is_file():
+            return None
+        try:
+            cached = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return None
+        if cached.get("trunk_sha") != sha or cached.get("base_etag") != etag:
+            return None
+        drift = cached.get("drift")
+        return dict(drift) if isinstance(drift, dict) else None
+
+    def _write_trunk_baseline(
+        self, sha: str, etag: str | None, drift: dict[str, list[str]]
+    ) -> None:
+        self.base_data_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"trunk_sha": sha, "base_etag": etag, "drift": drift}
+        self._trunk_baseline_path().write_text(json.dumps(payload, indent=1, sort_keys=True))
+
+    def _trunk_runner(self, env_dir: Path) -> TofuRunner:
+        """Runner rooted at the exported trunk env dir, backend on the base key.
+
+        No overlay variable is exported: the baseline must be what the trunk
+        pipeline itself would plan.
+        """
+        data_dir = self.trunk_data_dir
+        data_dir.mkdir(parents=True, exist_ok=True)
+        runner = self._runner_factory(
+            self.cfg.binary, env_dir, data_dir, env={}, stream=self.console.stream
+        )
+        if runner.needs_init(self.base_key):
+            self.console.info(f"init trunk data dir ({self.base_key})")
+            runner.init(self.backend, self.base_key)
+        runner.ensure_backend_key(self.base_key)
+        return runner
+
+    def _plan_trunk(self, env_dir: Path) -> dict[str, list[str]]:
+        """Plan the trunk config against the base state; non no-op managed changes."""
+        runner = self._trunk_runner(env_dir)
+        _prune_plan_files(self.trunk_data_dir)
+        planfile = self.trunk_data_dir / f"tfplan.trunk.{new_run_id()}"
+        try:
+            runner.plan(planfile)
+            changes, _drift, summary = planmod.parse_plan(runner.show_json(planfile))
+        finally:
+            planfile.unlink(missing_ok=True)
+        self.console.info("trunk baseline: " + planmod.render_summary(summary))
+        return {
+            c.address: list(c.actions)
+            for c in changes
+            if c.mode != "data" and tuple(c.actions) not in (("no-op",), ("read",))
+        }
+
+    def trunk_baseline(self, refresh: bool = False) -> dict[str, list[str]] | None:
+        """``address -> actions`` of a plan of the trunk config against the base state.
+
+        The trunk tree is ``git archive origin/<trunk>`` exported under
+        :attr:`trunk_cache_dir` and planned from the same relative env dir in
+        :attr:`trunk_data_dir` (base key, ``-refresh`` on, read-only). The
+        result is cached in the base data dir keyed by (trunk sha, base ETag)
+        and recomputed when either changed or on ``refresh``. Returns ``None``
+        with a warning when ``origin/<trunk>`` is unknown locally, the export
+        fails or the env dir does not exist on the trunk; a failing tofu plan
+        raises.
+        """
+        ref = f"origin/{self.cfg.policy.trunk_branch}"
+        sha = trunkmod.trunk_sha(self.repo_root, ref)
+        if sha is None:
+            self.console.warn(f"{ref} is unknown locally; trunk drift not checked")
+            return None
+        head = self.store.head(self.base_key)
+        etag = head["etag"] if head else None
+        if not refresh:
+            cached = self._read_trunk_baseline(sha, etag)
+            if cached is not None:
+                return cached
+        try:
+            export_dir, _sha = trunkmod.ensure_trunk_export(
+                self.repo_root, ref, self.trunk_cache_dir
+            )
+            env_dir = trunkmod.trunk_env_dir(export_dir, self.repo_root, self.cwd)
+        except OverlayError as exc:
+            self.console.warn(f"trunk export failed ({exc}); trunk drift not checked")
+            return None
+        if not env_dir.is_dir():
+            relative = os.path.relpath(env_dir, export_dir)
+            self.console.warn(f"{relative} does not exist on {ref}; trunk drift not checked")
+            return None
+        self.console.info(f"trunk baseline: planning {ref} ({sha[:12]}) against the base state")
+        drift = self._plan_trunk(env_dir)
+        self._write_trunk_baseline(sha, etag, drift)
+        return drift
+
     # ------------------------------------------------------------------ claims from state
 
     def _claims_from_state(self, claims: dict[str, Claim], doc: dict) -> dict[str, Claim]:
@@ -862,8 +976,14 @@ class OverlayService:
         extra: list[str] | None = None,
         allow_behind: bool = False,
         detailed_exitcode: bool = False,
+        accept_drift: bool = False,
     ) -> tuple[PolicyResult, PlanSummary, Path, bool]:
-        """Validate, plan against the overlay state and evaluate the policy (read-only)."""
+        """Validate, plan against the overlay state and evaluate the policy (read-only).
+
+        Base updates that are trunk drift (DESIGN §7.8) are listed in
+        ``policy.drift`` and not claimed; with ``accept_drift`` they are
+        claimed as regular updates (the baseline is then informative only).
+        """
         extra = list(extra or [])
         validate_passthrough(extra)
         doc, ov = self._load()
@@ -881,18 +1001,57 @@ class OverlayService:
         planfile = self.data_dir / f"tfplan.{new_run_id()}"
         runner.plan(planfile, extra=extra)
         changes, drift, summary = planmod.parse_plan(runner.show_json(planfile))
-        policy = planmod.evaluate(
-            changes,
-            drift,
-            base_addresses=self._base_addresses(),
-            base_identities=self._base_identities(),
-            me=ov,
-            doc=doc,
-            knowledge=self.knowledge,
-            registry=self.registry,
-        )
+
+        def evaluate(trunk_drift: dict[str, list[str]] | None) -> PolicyResult:
+            return planmod.evaluate(
+                changes,
+                drift,
+                base_addresses=self._base_addresses(),
+                base_identities=self._base_identities(),
+                me=ov,
+                doc=doc,
+                knowledge=self.knowledge,
+                registry=self.registry,
+                trunk_drift=trunk_drift,
+            )
+
+        policy = self._classify_drift(ov, evaluate, accept_drift=accept_drift)
         self._report_policy(policy, summary)
         return policy, summary, planfile, stale
+
+    def _classify_drift(
+        self,
+        ov: Overlay,
+        evaluate: Callable[[dict[str, list[str]] | None], PolicyResult],
+        *,
+        accept_drift: bool,
+    ) -> PolicyResult:
+        """Run the policy, then the trunk baseline only when new update claims appeared."""
+        policy = evaluate(None)
+        new_updates = sorted(
+            a
+            for a, c in policy.claims.items()
+            if c.kind is ClaimKind.UPDATE and a not in ov.claims
+        )
+        if not new_updates:
+            return policy
+        if accept_drift:
+            try:
+                baseline = self.trunk_baseline()
+            except OverlayError as exc:
+                self.console.warn(
+                    f"trunk baseline failed ({exc}); --accept-drift claims every update"
+                )
+                return policy
+            accepted = [a for a in new_updates if baseline and a in baseline]
+            if accepted:
+                policy.warnings.append(
+                    f"--accept-drift: {len(accepted)} drifted base resource(s) claimed as "
+                    f"updates ({', '.join(accepted)})"
+                )
+            return policy
+        baseline = self.trunk_baseline()
+        return evaluate(baseline) if baseline else policy
 
     def _verify_mode(self, ov: Overlay) -> tuple[PolicyResult, PlanSummary, Path, bool]:
         """`plan` in status merging re-runs the merge verification (DESIGN 8)."""
@@ -913,6 +1072,12 @@ class OverlayService:
 
     def _report_policy(self, policy: PolicyResult, summary: PlanSummary) -> None:
         self.console.info(planmod.render_summary(summary))
+        for address in policy.ignored:
+            self.console.info(
+                f"ignored: {address} (environment-dependent attributes only, not claimed)"
+            )
+        for address in policy.drift:
+            self.console.info(f"drift: {address} (trunk not applied on this base, not claimed)")
         for warning in policy.warnings:
             self.console.warn(warning)
         for v in policy.violations:
@@ -931,18 +1096,24 @@ class OverlayService:
         allow_behind: bool,
         extra: list[str] | None = None,
         yes: bool = False,
+        accept_drift: bool = False,
     ) -> Overlay:
         """Plan, confirm, acquire claims atomically, apply, then record ids from the state.
 
         A saved plan never prompts in tofu, so the confirmation is the tool's
         own: skipped with ``--auto-approve`` or ``--yes``, refused in CI without
-        them.
+        them. Trunk drift on base updates refuses the apply (exit 4) unless
+        ``accept_drift``, which claims those updates (DESIGN §7.8).
         """
         if config.is_ci() and (allow_stale or allow_behind):
             raise PolicyError("--allow-stale/--allow-behind are refused in CI")
+        if config.is_ci() and accept_drift and not yes:
+            raise PolicyError("--accept-drift requires --yes in CI")
         _doc, ov = self._load()
         self._gate(ov, {Status.ACTIVE, Status.DIRTY}, "apply")
-        policy, summary, planfile, stale = self.plan(extra=extra, allow_behind=allow_behind)
+        policy, summary, planfile, stale = self.plan(
+            extra=extra, allow_behind=allow_behind, accept_drift=accept_drift
+        )
         try:
             return self._apply_planned(
                 ov, policy, summary, planfile, stale,
@@ -964,6 +1135,12 @@ class OverlayService:
     ) -> Overlay:
         if stale and not allow_stale:
             raise StaleError("overlay is stale; run `rebase` (or --allow-stale outside CI)")
+        if policy.drift:
+            raise DriftError(
+                f"{len(policy.drift)} base resource(s) differ because the trunk is not applied "
+                f"on this base ({', '.join(policy.drift)}); run the trunk pipeline, then "
+                "`rebase`, or pass --accept-drift to claim them"
+            )
         if not policy.ok:
             raise PolicyError(f"{len(policy.violations)} policy violation(s), apply refused")
         if not _has_changes(summary):
@@ -1119,7 +1296,21 @@ class OverlayService:
             errors.append(f"conflict: {v.address} {v.message} (overlay {v.other_overlay})")
         errors += self._check_imports_file(ov)
         self._check_remote_links(errors, warnings)
+        self._check_trunk_drift(warnings)
         return not errors, errors, warnings
+
+    def _check_trunk_drift(self, warnings: list[str]) -> None:
+        """Warn when a trunk plan would change base resources (trunk not applied)."""
+        try:
+            baseline = self.trunk_baseline()
+        except OverlayError as exc:
+            warnings.append(f"trunk drift not checked: {exc}")
+            return
+        if baseline:
+            warnings.append(
+                f"trunk drift: {len(baseline)} resource(s) would change under a trunk plan "
+                f"({', '.join(sorted(baseline))}); the trunk is not applied on this base"
+            )
 
     def _check_imports_file(self, ov: Overlay) -> list[str]:
         from tofu_overlay.merge import IMPORTS_FILENAME, read_imports_addresses

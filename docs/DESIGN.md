@@ -38,7 +38,7 @@ The cloud has no branches: two overlays can run in parallel only when their clou
 - **overlay key**: `<key>@<name>`; if `<key>` has an extension the suffix goes before it (`terraform@<name>.tfstate`). `<name>` = `<slug(branch)[:34]>-<sha1(branch)[:6]>`, or `--name`/`TOFU_OVERLAY_NAME`. The name is recomputed from the branch on every run; there is no `current` file.
 - **registry key**: `<key>.overlays.json` (extension-aware: `terraform.overlays.json`). One JSON document per base, S3 conditional writes (`IfMatch` ETag; `IfNoneMatch: *` on creation, only when no `<key>@*` object exists).
 - **archive key**: `<key>@<name>.<status>-<timestamp>` used by `finalize`/`abandon` instead of deleting the overlay state outright (`gc --purge` deletes archives later).
-- **data dirs**: `.tofu-overlay/<name>/` (overlay) and `.tofu-overlay/_base/` (base, read-only use: `state pull`, verify plans). `TF_PLUGIN_CACHE_DIR` defaults to `~/.cache/tofu-overlay/plugins`. The tool warns if `.tofu-overlay/` is not git-ignored.
+- **data dirs**: `.tofu-overlay/<name>/` (overlay), `.tofu-overlay/_base/` (base, read-only use: `state pull`, verify plans, `trunk_baseline.json` cache) and `.tofu-overlay/_trunk-data/` (base key, read-only: the trunk baseline plan, §7.8). `.tofu-overlay/_trunk/<sha>/` holds the exported trunk tree (`git archive origin/<trunk>`, latest sha only). `TF_PLUGIN_CACHE_DIR` defaults to `~/.cache/tofu-overlay/plugins`. The tool warns if `.tofu-overlay/` is not git-ignored.
 
 ## 5. Registry document
 
@@ -95,10 +95,10 @@ All commands run from the stack's env directory (`-C/--chdir` accepted). Backend
 | Command | Effect |
 |---|---|
 | `create [--name N] [--force-name]` | Register `creating` (CAS), pull base (base data dir), set new lineage, serial 0 → push to the overlay key (overlay data dir, `init -reconfigure -backend-config=key=<overlay>` with the original backend-config files first and `key` last), record `base_etag`/`base_serial`/`trunk_commit`, flip to `active`. Refuses: base key not allowed, name active, tombstoned name, `<key>@<name>` object or `-md5` item already present outside the registry (run `doctor`), base object missing (no `--empty-base` in v1). Re-running resumes a `creating` entry. |
-| `plan [--json] [--detailed-exitcode] [-- tofu args]` | Validate overlay (§3.7), freshness and git ancestry, `init` if needed, `plan -out=tfplan.<run_id> -detailed-exitcode`, `show -json`, policy checks (§7). Read-only. In status `merging`: verify mode (§8). |
-| `apply [--auto-approve] [--allow-stale]` | `plan` then: mark `applying` + `run_id` (CAS, refuse if base moved), **acquire claims atomically** (re-run checks 3-5 inside the CAS), `apply tfplan`, pull overlay state, fill `id`/`import_id`/identity from state (filtered by `after_sensitive`), record `applied_commit`, `caller_arn`, `tofu_version`, re-read base ETag (moved → stale), status `active` (or `dirty` on failure; claims kept). A saved plan never prompts in tofu, so the tool asks its own yes/no confirmation before acquiring claims (skipped by `--auto-approve` or `--yes`, refused in CI without them); `--auto-approve` only in CI or with `--yes`. Own resources deleted by the plan lose their claim once the apply succeeded and the state confirms they are gone; a superseded apply (stale `applying` taken over by a newer run) cannot record its outcome. |
+| `plan [--json] [--detailed-exitcode] [-- tofu args]` | Validate overlay (§3.7), freshness and git ancestry, `init` if needed, `plan -out=tfplan.<run_id> -detailed-exitcode`, `show -json`, policy checks (§7). When the plan holds a new `update` on a base address, the trunk baseline (§7.8) is computed (cached) and the drifted addresses are listed separately from the claims (`drift: ADDR` lines; `--json` carries `drift: [...]` and `ignored: [...]`). Read-only. In status `merging`: verify mode (§8). |
+| `apply [--auto-approve] [--allow-stale] [--accept-drift]` | Refuses with exit 4 when `plan` reports trunk drift on base updates, unless `--accept-drift` (in CI it also requires `--yes`): the drifted addresses are then claimed as regular `update`s, with a warning listing them. Then `plan` then: mark `applying` + `run_id` (CAS, refuse if base moved), **acquire claims atomically** (re-run checks 3-5 inside the CAS), `apply tfplan`, pull overlay state, fill `id`/`import_id`/identity from state (filtered by `after_sensitive`), record `applied_commit`, `caller_arn`, `tofu_version`, re-read base ETag (moved → stale), status `active` (or `dirty` on failure; claims kept). A saved plan never prompts in tofu, so the tool asks its own yes/no confirmation before acquiring claims (skipped by `--auto-approve` or `--yes`, refused in CI without them); `--auto-approve` only in CI or with `--yes`. Own resources deleted by the plan lose their claim once the apply succeeded and the state confirms they are gone; a superseded apply (stale `applying` taken over by a newer run) cannot record its outcome. |
 | `status [--json] [--repo]` / `list [--json]` | Overlays of this base (or every base under `policy.env_dir_glob` with `--repo`), owners, branch, freshness, status, claims, age, pending reverts. Read-only. `list --bucket B --prefix P` scans `*.overlays.json` without a checkout. |
-| `check [--json] [--repo]` | CI gate, read-only: overlay exists for the branch (else exit 0 with a "no overlay" line), fresh, branch contains trunk, every `create` claim has an instance in the overlay state, no base resource with a claimed address/identity appeared, no conflicting overlay, imports file (if any) matches the claims. |
+| `check [--json] [--repo]` | CI gate, read-only: overlay exists for the branch (else exit 0 with a "no overlay" line), fresh, branch contains trunk, every `create` claim has an instance in the overlay state, no base resource with a claimed address/identity appeared, no conflicting overlay, imports file (if any) matches the claims. Trunk drift (§7.8) is reported as a warning (`trunk drift: N resource(s) would change under a trunk plan`). |
 | `rebase` | Refuse if stale-only is false, status not `active`, or the branch is behind trunk. Pull base and overlay, build the new document locally (base content + overlay's `create` instances merged per resource entry, `provider` equality and `schema_version` checks, overlay lineage kept, serial = max + 1), conflict checks against the new base (address, identity), one `state push` to the overlay key, then update `base_etag`/`base_serial`/`trunk_commit`. Typed confirmation. Previous overlay state archived (`.rebase-<ts>`). |
 | `merge [--undo] [--allow-import-updates] [--accept-recreate ADDR,…] [--allow-unapplied]` | Import strategy only in v1. Refuse if dirty, HEAD != `applied_commit` or dirty tree (unless `--allow-unapplied`), or any `create` claim is non-importable (listed, unless accepted for recreation). Write `zz_overlay_<name>.imports.tf` in the env dir (must not be a symlink; sorted; header with overlay, base key/ETag, commit, per-block identity), verify (§8), status `merging`. `--undo` deletes the file and returns to `active`. |
 | `finalize [--purge]` | Precondition: the trunk applied the imports. Pull base: every `create` claim must be present with the same `id` (an address present with a different id = the trunk created its own object → refuse with report). Archive the overlay key (copy to archive key, delete object + `-md5` item + `.tflock`), remove local data dir, status `merged` → tombstone. Prints the `git rm` for the imports file (never edits the trunk). Typed confirmation. |
@@ -116,12 +116,12 @@ Two variables are exported to every tofu run of an overlay (plan, apply, the des
 
 ## 7. Policy checks (plan JSON)
 
-Input: `resource_changes[]` (address, `previous_address`, `deposed`, type, `mode`, `change.actions`, `before`, `after`, `after_unknown`, `before_sensitive`, `after_sensitive`, `replace_paths`, `importing`, `action_reason`), `resource_drift[]`, the set of base addresses (from the base state pulled at `create`/`rebase`, cached in the overlay data dir and refreshed on demand), the registry, and the type knowledge.
+Input: `resource_changes[]` (address, `previous_address`, `deposed`, type, `mode`, `change.actions`, `before`, `after`, `after_unknown`, `before_sensitive`, `after_sensitive`, `replace_paths`, `importing`, `action_reason`), `resource_drift[]`, the set of base addresses (from the base state pulled at `create`/`rebase`, cached in the overlay data dir and refreshed on demand), the registry, the type knowledge and, when the plan holds a new `update` on a base address, the trunk baseline (item 8).
 
 1. Freshness (§3.8).
 2. Actions, explicit allow-list; anything else is denied:
    - `["create"]` → allowed; claim `create` (identity from `after`, minus sensitive attributes; unknown identity → address-only claim + warning).
-   - `["update"]` on a base address → allowed with an `update` claim (exclusive). On an address created by this overlay → allowed, no claim.
+   - `["update"]` on a base address → items 7 and 8 first; otherwise allowed with an `update` claim (exclusive). On an address created by this overlay → allowed, no claim.
    - `["no-op"]`, `["read"]` → ignored.
    - `["delete"]`, `["delete","create"]`, `["create","delete"]`, `["forget"]`, `["forget","create"]` on a base address → denied. On an address created by this overlay → allowed (replace of own resource).
    - `previous_address` set (moved) on a base address → denied. `importing` set on an address (branch `import {}` block) → denied (an overlay adopts nothing). `deposed` entries → allowed only for `create` claims.
@@ -129,8 +129,10 @@ Input: `resource_changes[]` (address, `previous_address`, `deposed`, type, `mode
 4. Identity conflict: another live overlay's `create` claim has the same identity → denied.
 5. Base identity conflict: a `create` whose identity already exists in the base state → denied.
 6. Drift on own updates (warning): `resource_drift[]` entry for an `update` claim whose refreshed value differs from `after_hash` recorded at apply → "the trunk (or someone) changed it, rebase".
+7. Environment-dependent attributes (noise): an `update` on a base address whose differing top-level attributes (`before` vs `after`, `after_unknown` keys excluded) are all in `ignored_attributes[type]` (globs; `"*"` applies to every type; defaults: `aws_lambda_function: [filename, last_modified]`, `aws_lambda_layer_version: [filename]`, `archive_file: [output_path]`, `"*": [last_modified]`) is **not a branch change**: no claim, listed in `PolicyResult.ignored`, one warning. The change stays in the tofu plan and is applied (tofu cannot skip a change without `-target`); it is harmless by construction (a local path under another `TF_DATA_DIR`, a timestamp).
+8. Trunk drift: the **trunk baseline** is a plan of the trunk config (`git archive origin/<trunk>` exported under `.tofu-overlay/_trunk/<sha>/`, never a worktree, planned from the same relative env dir in `.tofu-overlay/_trunk-data/`, backend on the base key, `-refresh` on, no overlay variable exported) against the **base state**: `address -> actions` of every non-no-op managed change, cached in `.tofu-overlay/_base/trunk_baseline.json` keyed by (trunk sha, base ETag). An `update` on a base address that appears in the baseline (and is not already under an `update` claim of this overlay) is **drift**: the base lags the trunk and a trunk plan would produce that update too. No claim, listed in `PolicyResult.drift`, one warning ("N base resources differ because the trunk is not applied on this base: run the trunk pipeline, then `rebase`, or pass --accept-drift to claim them"). `apply` refuses (exit 4) unless `--accept-drift`, which turns them into regular `update` claims. `delete`/replace of base addresses stay denied whatever the baseline says. When `origin/<trunk>` is unknown locally, the export fails or the env dir does not exist on the trunk, the baseline is unavailable (warning) and every base update is claimed as before.
 
-Checks 3-5 are recomputed inside the registry critical section when claims are acquired.
+Order per base `update`: 7 (ignored attributes), then 8 (drift), then the claim. Checks 3-5 are recomputed inside the registry critical section when claims are acquired.
 
 ## 8. Merge verification (import strategy)
 
@@ -148,7 +150,7 @@ The verify plan runs the **branch config** against the **base state** in the bas
 
 `data/identity.yaml`: `type → [attribute paths]` (e.g. `aws_route53_record: [zone_id, name, type, set_identifier]`, `kubernetes_namespace: [metadata.0.name]`). Fallback: first present among `name, bucket, identifier, function_name, domain_name, cluster_identifier, cluster_id, replication_group_id, key`. Values are normalised (Route53 names lower-cased without trailing dot).
 
-`data/import_ids.yaml`: `formats: type → "{attr}/…"`, `non_importable: […]`, `replace_prone: […]`, `virtual_attributes: type → [attrs]`. Users extend both with `.tofu-overlay.yaml` (`identity:`, `import_ids:`, `virtual_attributes:`, `policy:`).
+`data/import_ids.yaml`: `formats: type → "{attr}/…"`, `non_importable: […]`, `replace_prone: […]`, `virtual_attributes: type → [attrs]`, `ignored_attributes: type glob → [attrs]` (§7.7). Users extend both with `.tofu-overlay.yaml` (`identity:`, `import_ids:`, `virtual_attributes:`, `ignored_attributes:`, `policy:`).
 
 ## 10. Configuration file `.tofu-overlay.yaml` (repo root, found by walking up)
 
@@ -164,6 +166,7 @@ binary: tofu
 identity: {}
 import_ids: {}
 virtual_attributes: {}
+ignored_attributes: {}     # type glob -> [environment-dependent attrs], §7.7
 ```
 
 ## 11. Deferred (documented, not implemented)
@@ -183,6 +186,7 @@ src/tofu_overlay/
   __init__.py     version
   cli.py          typer app, exit-code mapping
   config.py       .tofu-overlay.yaml, CI detection, overlay naming, git helpers
+  trunk.py        trunk baseline helpers: git archive export, env dir mapping, per-sha cache
   backend.py      backend resolution (type reported, unsupported types refused), workspace refusal
   store.py        StateStore protocol, CasConflict, make_store(cfg) factory on backend_type
   s3state.py      s3 StateStore: boto3 session, HEAD/list/copy/delete, registry JSON CAS, DynamoDB digest/lock items
@@ -190,7 +194,7 @@ src/tofu_overlay/
   tofu.py         runner: init/plan/show/apply/state pull|push|rm, arg validation, streaming
   state.py        state document helpers: addresses, instances, inject/remove, lineage/serial, identity
   identity.py     type knowledge loader (YAML + overrides), identity/import-id/virtual attrs
-  plan.py         plan JSON analysis and policy checks
+  plan.py         plan JSON analysis and policy checks (ignored attributes, trunk drift)
   overlay.py      create/plan/apply/status/check/rebase/abandon/finalize/gc/doctor
   merge.py        imports file generation, verify, undo, guard
   output.py       console/CI/JSON output, confirmations

@@ -16,11 +16,16 @@
 # virtual_attributes: type -> attributes that never round-trip through the
 #                     provider (write-only or behavioural). A verify plan may
 #                     show an `update` on a create claim when only these differ.
+# ignored_attributes: type (glob, "*" = every type) -> attributes whose value
+#                     depends on where tofu runs rather than on the config
+#                     (local paths under TF_DATA_DIR, timestamps). An overlay
+#                     `update` on a base resource that only changes these is
+#                     not a branch change: not claimed, applied as is.
 #
-# Users extend both maps through `.tofu-overlay.yaml` (`import_ids:`,
-# `virtual_attributes:`, `non_importable:`, `replace_prone:`). Per-type import
-# formats from the user replace package entries; virtual attribute lists and
-# the two type lists are unioned.
+# Users extend the maps through `.tofu-overlay.yaml` (`import_ids:`,
+# `virtual_attributes:`, `ignored_attributes:`, `non_importable:`,
+# `replace_prone:`). Per-type import formats from the user replace package
+# entries; attribute lists and the two type lists are unioned.
 
 formats:
   # --- S3 ---------------------------------------------------------------
@@ -426,3 +431,14 @@ virtual_attributes:
     - wait_for_service_account_token
     - wait_until_bound
     - wait_for_load_balancer
+
+ignored_attributes:
+  "*":
+    - last_modified
+  aws_lambda_function:
+    - filename
+    - last_modified
+  aws_lambda_layer_version:
+    - filename
+  archive_file:
+    - output_path

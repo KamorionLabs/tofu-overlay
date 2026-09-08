@@ -66,6 +66,12 @@ class StaleError(OverlayError):
     exit_code = ExitCode.STALE
 
 
+class DriftError(StaleError):
+    """Trunk drift on base resources the overlay would update (exit 4, see DESIGN §7.8)."""
+
+    exit_code = ExitCode.STALE
+
+
 class RegistryError(OverlayError):
     """Registry conflict, unreachable or invalid document (exit 5)."""
 
@@ -335,6 +341,7 @@ class ToolConfig(BaseModel):
     identity: dict[str, list[str]] = Field(default_factory=dict)
     import_ids: dict[str, str] = Field(default_factory=dict)
     virtual_attributes: dict[str, list[str]] = Field(default_factory=dict)
+    ignored_attributes: dict[str, list[str]] = Field(default_factory=dict)
     non_importable: list[str] = Field(default_factory=list)
     replace_prone: list[str] = Field(default_factory=list)
 
@@ -393,11 +400,20 @@ class Violation(BaseModel):
 
 
 class PolicyResult(BaseModel):
-    """Outcome of the policy checks on a plan (DESIGN §7)."""
+    """Outcome of the policy checks on a plan (DESIGN §7).
+
+    ``drift`` lists base addresses whose ``update`` is trunk drift (the trunk
+    config is not applied on the base state): not claimed, ``apply`` refuses
+    them unless ``--accept-drift``. ``ignored`` lists base addresses whose
+    ``update`` only touches environment-dependent attributes: not claimed,
+    still applied by tofu.
+    """
 
     violations: list[Violation] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     claims: dict[str, Claim] = Field(default_factory=dict)
+    drift: list[str] = Field(default_factory=list)
+    ignored: list[str] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:

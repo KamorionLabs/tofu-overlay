@@ -23,6 +23,8 @@ from tofu_overlay import cli, config
 from tofu_overlay import state as statemod
 from tofu_overlay.merge import IMPORTS_FILENAME, MergeService, read_imports_addresses
 from tofu_overlay.models import (
+    ClaimKind,
+    DriftError,
     ExitCode,
     FrozenError,
     PolicyError,
@@ -32,10 +34,12 @@ from tofu_overlay.models import (
     ToolError,
 )
 from tofu_overlay.output import Console
-from tofu_overlay.overlay import REMOTE_KEYS_VAR, OverlayService
+from tofu_overlay.overlay import REMOTE_KEYS_VAR, TRUNK_DIR_NAME, OverlayService
 
 BRANCH = "feature/ABC-12-reports"
 NEW_ADDRESS = "aws_s3_bucket.reports"
+ROLE_ADDRESS = "aws_iam_role.app"
+LAMBDA_ADDRESS = "aws_lambda_function.worker"
 NEW_BUCKET = "acme-reports-overlay"
 PROVIDER = 'provider["registry.opentofu.org/hashicorp/aws"]'
 EKS_KEY = "acme/webshop/eks/dev"
@@ -43,12 +47,22 @@ LAMBDA_KEY = "acme/webshop/lambda/dev"
 
 
 class FakeRunner:
-    """TofuRunner stand-in: states live in the moto bucket, plans come from `desired`."""
+    """TofuRunner stand-in: states live in the moto bucket, plans come from `desired`.
+
+    A runner rooted under a trunk export (``.tofu-overlay/_trunk/<sha>/...``)
+    plans from ``desired_trunk`` (the trunk config); ``desired_by_cwd`` maps an
+    exact or ancestor directory to its own desired config and wins over both.
+    A desired entry whose ``attrs`` differ from the state plans as an ``update``
+    (``after_unknown`` optional).
+    """
 
     session: Any = None
     desired: dict[str, dict[str, Any]] = {}
+    desired_trunk: dict[str, dict[str, Any]] = {}
+    desired_by_cwd: dict[Path, dict[str, dict[str, Any]]] = {}
     calls: list[list[str]] = []
     envs: list[dict[str, str]] = []
+    plan_cwds: list[Path] = []
 
     def __init__(self, binary: str, cwd: Path, data_dir: Path, env=None, stream=None) -> None:
         self.binary = binary
@@ -148,20 +162,40 @@ class FakeRunner:
             "change": change,
         }
 
+    def _desired(self) -> dict[str, dict[str, Any]]:
+        for root, desired in FakeRunner.desired_by_cwd.items():
+            if self.cwd == root or root in self.cwd.parents:
+                return desired
+        if TRUNK_DIR_NAME in self.cwd.parts:
+            return FakeRunner.desired_trunk
+        return FakeRunner.desired
+
+    def _present_entry(self, address: str, entry: dict, inst: dict, spec: dict) -> dict:
+        attrs = inst.get("attributes") or {}
+        after = {**attrs, **(spec.get("attrs") or {})}
+        if after == attrs:
+            return self._entry(address, entry, inst, ["no-op"])
+        return self._entry(
+            address, entry, inst, ["update"],
+            before=attrs, after=after, after_unknown=spec.get("after_unknown") or {},
+        )
+
     def plan(self, out: Path, *, extra=None, destroy=False, targets=None, refresh=True) -> int:
         FakeRunner.calls.append(["plan", self.key, "destroy" if destroy else "", *(extra or [])])
+        FakeRunner.plan_cwds.append(self.cwd)
         present = statemod.index_instances(self.state_pull())
         imports = self._imports()
+        desired = self._desired()
         changes = []
         if destroy:
             for address, (entry, inst) in present.items():
                 if entry.get("mode") == "managed":
                     changes.append(self._entry(address, entry, inst, ["delete"]))
         else:
-            for address, spec in FakeRunner.desired.items():
+            for address, spec in desired.items():
                 if address in present:
                     entry, inst = present[address]
-                    changes.append(self._entry(address, entry, inst, ["no-op"]))
+                    changes.append(self._present_entry(address, entry, inst, spec))
                     continue
                 entry = {"type": spec["type"], "name": spec["name"], "mode": "managed"}
                 inst = {"attributes": spec["attrs"]}
@@ -177,7 +211,7 @@ class FakeRunner:
                         self._entry(address, entry, inst, ["create"], after_unknown={"id": True})
                     )
             for address, (entry, inst) in present.items():
-                if entry.get("mode") == "managed" and address not in FakeRunner.desired:
+                if entry.get("mode") == "managed" and address not in desired:
                     changes.append(self._entry(address, entry, inst, ["delete"]))
         out.write_text(
             json.dumps({"format_version": "1.2", "resource_changes": changes, "resource_drift": []})
@@ -195,6 +229,9 @@ class FakeRunner:
             actions = change["change"]["actions"]
             if actions == ["delete"]:
                 doc = statemod.remove_addresses(doc, {change["address"]})
+            elif actions == ["update"]:
+                _entry, inst = statemod.index_instances(doc)[change["address"]]
+                inst["attributes"] = dict(change["change"]["after"])
             elif actions == ["create"]:
                 attrs = dict(change["change"]["after"])
                 attrs["id"] = attrs.get("bucket") or f"id-{change['name']}"
@@ -245,19 +282,25 @@ def fake_runner(boto_session, base_in_s3: dict):
     FakeRunner.session = boto_session
     FakeRunner.calls = []
     FakeRunner.envs = []
+    FakeRunner.plan_cwds = []
     desired: dict[str, dict[str, Any]] = {}
     for address, (entry, _inst) in statemod.index_instances(base_in_s3).items():
         if entry.get("mode") == "managed":
             desired[address] = {"type": entry["type"], "name": entry["name"], "attrs": {}}
+    # The trunk config is the base as it is: a trunk plan is a no-op by default.
+    FakeRunner.desired_trunk = json.loads(json.dumps(desired))
     desired[NEW_ADDRESS] = {
         "type": "aws_s3_bucket",
         "name": "reports",
         "attrs": {"bucket": NEW_BUCKET, "force_destroy": False},
     }
     FakeRunner.desired = desired
+    FakeRunner.desired_by_cwd = {}
     yield FakeRunner
     FakeRunner.session = None
     FakeRunner.desired = {}
+    FakeRunner.desired_trunk = {}
+    FakeRunner.desired_by_cwd = {}
 
 
 @pytest.fixture
@@ -724,6 +767,190 @@ class TestMerge:
         assert _status_of(service) == Status.ACTIVE
 
 
+# ---------------------------------------------------------------------- trunk drift
+
+
+def _trunk_moves_role(description: str = "Application role v2") -> None:
+    """The trunk config (and the branch, which contains it) changes the role description."""
+    FakeRunner.desired_trunk[ROLE_ADDRESS]["attrs"] = {"description": description}
+    FakeRunner.desired[ROLE_ADDRESS]["attrs"] = {"description": description}
+
+
+def _commit_on_trunk(repo: Path, name: str) -> str:
+    """Add a file on main and push it (the feature branch is left where it is)."""
+    branch = git("branch", "--show-current", cwd=repo)
+    git("checkout", "-q", "main", cwd=repo)
+    (repo / name).write_text("x\n")
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", name, cwd=repo)
+    git("push", "-q", "origin", "main", cwd=repo)
+    git("checkout", "-q", branch, cwd=repo)
+    return git("rev-parse", "origin/main", cwd=repo)
+
+
+def _trunk_plans(service) -> list[Path]:
+    return [c for c in FakeRunner.plan_cwds if service.trunk_cache_dir in c.parents]
+
+
+def _overlay_attrs(s3_client, service, address: str) -> dict[str, Any]:
+    doc = json.loads(s3_client.get_object(Bucket=BUCKET, Key=service.overlay_key)["Body"].read())
+    return statemod.index_instances(doc)[address][1]["attributes"]
+
+
+class TestTrunkBaseline:
+    def test_cached_by_trunk_sha_and_base_etag(self, service, s3_client, base_in_s3, env_repo):
+        service.create()
+        _trunk_moves_role()
+        FakeRunner.plan_cwds.clear()
+        drift = service.trunk_baseline()
+        assert drift == {ROLE_ADDRESS: ["update"]}
+        assert len(_trunk_plans(service)) == 1
+        planned_in = _trunk_plans(service)[0]
+        assert planned_in.relative_to(service.trunk_cache_dir).parts[1:] == (
+            "stacks", "storage", "env", "dev",
+        )
+        assert json.loads((service.trunk_data_dir / "terraform.tfstate").read_text())[
+            "backend"]["config"]["key"] == BASE_KEY
+        assert {} in FakeRunner.envs  # the trunk runner exports no overlay variable
+        assert list(service.trunk_data_dir.glob("tfplan.*")) == []
+        cache = json.loads((service.base_data_dir / "trunk_baseline.json").read_text())
+        assert cache["trunk_sha"] == git("rev-parse", "origin/main", cwd=env_repo)
+        assert cache["base_etag"] == service.store.head(BASE_KEY)["etag"]
+        assert cache["drift"] == drift
+
+        assert service.trunk_baseline() == drift
+        assert len(_trunk_plans(service)) == 1  # cache hit
+        assert service.trunk_baseline(refresh=True) == drift
+        assert len(_trunk_plans(service)) == 2
+        _move_base(s3_client, base_in_s3)
+        assert service.trunk_baseline() == drift
+        assert len(_trunk_plans(service)) == 3  # base ETag changed
+        old_sha = cache["trunk_sha"]
+        new_sha = _commit_on_trunk(env_repo, "trunk.txt")
+        assert service.trunk_baseline() == drift
+        assert len(_trunk_plans(service)) == 4  # trunk sha changed
+        assert sorted(p.name for p in service.trunk_cache_dir.iterdir()) == [new_sha]
+        assert old_sha != new_sha
+
+    def test_desired_by_cwd_targets_the_exported_env_dir(self, service):
+        service.create()
+        FakeRunner.desired_by_cwd[service.trunk_cache_dir] = {
+            ROLE_ADDRESS: {"type": "aws_iam_role", "name": "app", "attrs": {"description": "x"}},
+        }
+        drift = service.trunk_baseline()
+        # every other base resource is absent from that config: the trunk would delete it
+        assert drift[ROLE_ADDRESS] == ["update"]
+        assert drift["aws_s3_bucket.logs"] == ["delete"]
+
+    def test_unknown_origin_trunk_is_a_warning(self, service, env_repo, console):
+        service.create()
+        git("update-ref", "-d", "refs/remotes/origin/main", cwd=env_repo)
+        assert service.trunk_baseline() is None
+        assert "origin/main is unknown locally" in console.stderr.getvalue()
+
+    def test_env_dir_absent_on_trunk_is_a_warning(self, multi_stack, console):
+        consumer = multi_stack("lambda")
+        consumer.create()
+        assert consumer.trunk_baseline() is None
+        assert "does not exist on origin/main" in console.stderr.getvalue()
+
+
+class TestTrunkDriftLifecycle:
+    def test_base_lagging_trunk_shows_drift_and_apply_needs_accept(
+        self, service, s3_client, console
+    ):
+        service.create()
+        _trunk_moves_role()
+        policy, summary, _planfile, stale = service.plan()
+        assert policy.ok and not stale
+        assert summary.create == 1 and summary.update == 1
+        assert policy.drift == [ROLE_ADDRESS]
+        assert set(policy.claims) == {NEW_ADDRESS}
+        assert any("trunk is not applied" in w and "--accept-drift" in w for w in policy.warnings)
+        assert f"drift: {ROLE_ADDRESS}" in console.stderr.getvalue()
+
+        FakeRunner.calls.clear()
+        with pytest.raises(DriftError, match="run the trunk pipeline") as exc:
+            service.apply(auto_approve=True, allow_stale=False, allow_behind=False)
+        assert exc.value.exit_code == ExitCode.STALE
+        assert not [c for c in FakeRunner.calls if c[0] == "apply"]
+        assert _status_of(service) == Status.ACTIVE
+        doc, _ = service.registry.load()
+        assert doc.overlays[service.name].claims == {}
+
+        ov = service.apply(
+            auto_approve=True, allow_stale=False, allow_behind=False, accept_drift=True
+        )
+        assert ov.status == Status.ACTIVE
+        assert ov.claims[ROLE_ADDRESS].kind is ClaimKind.UPDATE
+        assert NEW_ADDRESS in ov.claims
+        assert "--accept-drift" in console.stderr.getvalue()
+        assert _overlay_attrs(s3_client, service, ROLE_ADDRESS)["description"] == (
+            "Application role v2"
+        )
+        # Once claimed, the address is the overlay's own: no drift on the next plan.
+        policy, _summary, _planfile, _stale = service.plan()
+        assert policy.drift == []
+
+    def test_check_warns_about_trunk_drift(self, service, s3_client):
+        service.create()
+        _trunk_moves_role()
+        ok, errors, warnings = service.check()
+        assert ok, errors
+        assert any(w.startswith("trunk drift:") and ROLE_ADDRESS in w for w in warnings)
+
+    def test_accept_drift_in_ci_requires_yes(self, service, monkeypatch):
+        service.create()
+        monkeypatch.setenv("CI", "true")
+        with pytest.raises(PolicyError, match="--accept-drift requires --yes"):
+            service.apply(
+                auto_approve=True, allow_stale=False, allow_behind=False, accept_drift=True
+            )
+
+    def test_no_base_update_skips_the_trunk_baseline(self, service):
+        service.create()
+        FakeRunner.plan_cwds.clear()
+        policy, _summary, _planfile, _stale = service.plan()
+        assert policy.ok and policy.drift == []
+        assert _trunk_plans(service) == []
+
+
+class TestIgnoredAttributesLifecycle:
+    def test_lambda_filename_change_is_applied_without_claim(self, service, s3_client, console):
+        service.create()
+        FakeRunner.desired[LAMBDA_ADDRESS]["attrs"] = {
+            "filename": ".tofu-overlay/feature/.terraform/modules/worker/code.zip",
+        }
+        FakeRunner.desired[LAMBDA_ADDRESS]["after_unknown"] = {"last_modified": True}
+        FakeRunner.plan_cwds.clear()
+        policy, summary, _planfile, _stale = service.plan()
+        assert policy.ok
+        assert summary.update == 1
+        assert policy.ignored == [LAMBDA_ADDRESS]
+        assert policy.drift == []
+        assert set(policy.claims) == {NEW_ADDRESS}
+        assert any("environment-dependent" in w for w in policy.warnings)
+        assert f"ignored: {LAMBDA_ADDRESS}" in console.stderr.getvalue()
+        assert _trunk_plans(service) == []  # nothing left to classify as drift
+
+        ov = service.apply(auto_approve=True, allow_stale=False, allow_behind=False)
+        assert ov.status == Status.ACTIVE
+        assert LAMBDA_ADDRESS not in ov.claims
+        assert ov.last_apply["summary"]["update"] == 1
+        assert _overlay_attrs(s3_client, service, LAMBDA_ADDRESS)["filename"].startswith(
+            ".tofu-overlay/"
+        )
+        ok, errors, _warnings = service.check()
+        assert ok, errors
+
+    def test_real_change_on_lambda_is_claimed(self, service):
+        service.create()
+        FakeRunner.desired[LAMBDA_ADDRESS]["attrs"] = {"filename": "x.zip", "memory_size": 512}
+        policy, _summary, _planfile, _stale = service.plan()
+        assert policy.ignored == []
+        assert policy.claims[LAMBDA_ADDRESS].kind is ClaimKind.UPDATE
+
+
 # ---------------------------------------------------------------------- multi-stack
 
 
@@ -1014,6 +1241,36 @@ class TestCli:
         assert result.exit_code == int(ExitCode.REGISTRY), result.output
         result = _invoke(cli_env, "--yes", "apply", "--auto-approve")
         assert result.exit_code == int(ExitCode.REGISTRY), result.output
+
+    def test_accept_drift_flag_and_exit_codes(self, cli_env, monkeypatch):
+        assert _invoke(cli_env, "create").exit_code == 0
+        _trunk_moves_role()
+        result = _invoke(cli_env, "--json", "plan")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["drift"] == [ROLE_ADDRESS] and payload["ignored"] == []
+        assert payload["policy"]["drift"] == [ROLE_ADDRESS]
+        assert ROLE_ADDRESS not in payload["policy"]["claims"]
+
+        result = _invoke(cli_env, "--yes", "apply", "--auto-approve")
+        assert result.exit_code == int(ExitCode.STALE), result.output
+        assert "--accept-drift" in result.output
+
+        monkeypatch.setenv("CI", "true")
+        result = _invoke(cli_env, "apply", "--accept-drift")
+        assert result.exit_code == int(ExitCode.POLICY), result.output
+        assert "--accept-drift requires --yes" in result.output
+        monkeypatch.delenv("CI")
+
+        result = _invoke(cli_env, "--json", "--yes", "apply", "--auto-approve", "--accept-drift")
+        assert result.exit_code == 0, result.output
+        claims = json.loads(result.stdout)["overlay"]["claims"]
+        assert claims[ROLE_ADDRESS]["kind"] == "update"
+
+        result = _invoke(cli_env, "--json", "check")
+        assert result.exit_code == 0, result.output
+        warnings = json.loads(result.stdout)["results"][0]["warnings"]
+        assert any(w.startswith("trunk drift:") for w in warnings)
 
     def test_chdir_with_relative_backend_config(self, cli_env, monkeypatch):
         repo = cli_env.parents[3]

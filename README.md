@@ -116,11 +116,11 @@ lock table). Read-only commands never write anything, registry included.
 | Command | Writes | Effect |
 |---|---|---|
 | `create [--name N] [--force-name]` | overlay key, registry | Fork the base state into `<key>@<name>`, register the overlay. Refuses a tombstoned name, an existing `<key>@<name>` object outside the registry, a missing base. Re-running resumes a `creating` entry. |
-| `plan [--json] [--detailed-exitcode] [-- tofu args]` | none | Validate the overlay, freshness and git ancestry, `tofu plan` against the overlay state, `show -json`, policy checks. In status `merging`: verify mode. |
-| `apply [--auto-approve] [--allow-stale]` | overlay key, registry | `plan`, then acquire claims atomically (registry CAS), `tofu apply`, refresh claim ids from the overlay state. Refuses stale overlays. |
+| `plan [--json] [--detailed-exitcode] [-- tofu args]` | none | Validate the overlay, freshness and git ancestry, `tofu plan` against the overlay state, `show -json`, policy checks. Base updates that a trunk plan would also produce (the trunk is not applied on this base) are listed as `drift`, not claimed; updates touching only environment-dependent attributes are `ignored`. In status `merging`: verify mode. |
+| `apply [--auto-approve] [--allow-stale] [--accept-drift]` | overlay key, registry | `plan`, then acquire claims atomically (registry CAS), `tofu apply`, refresh claim ids from the overlay state. Refuses stale overlays and trunk drift (exit 4; `--accept-drift` claims the drifted updates, with `--yes` in CI). |
 | `status [--json] [--repo]` | none | Overlays of this base (or of every base under `env_dir_glob`): owners, branch, freshness, status, claims, age, pending reverts. |
 | `list [--json]` | none | Same data as `status`, one line per overlay. `--bucket B --prefix P` scans registries without a checkout. |
-| `check [--json] [--repo]` | none | CI gate: overlay exists for the branch (else "no overlay", exit 0), fresh, branch contains trunk, claims match the overlay state, no conflicting overlay, imports file matches the claims. |
+| `check [--json] [--repo]` | none | CI gate: overlay exists for the branch (else "no overlay", exit 0), fresh, branch contains trunk, claims match the overlay state, no conflicting overlay, imports file matches the claims; warns about trunk drift. |
 | `rebase` | overlay key, registry | Re-fork on the current base while keeping the overlay's own resources. Typed confirmation; the previous overlay state is archived. |
 | `merge [--undo] [--allow-import-updates] [--accept-recreate ADDR,...] [--allow-unapplied]` | imports file, registry | Write and verify `zz_overlay_<name>.imports.tf`, status `merging`. `--undo` deletes the file and returns to `active`. |
 | `finalize [--purge]` | S3 archive/delete, DynamoDB, registry | After the trunk applied the imports: verify every created resource is in the base with the same id, archive the overlay key, release claims. Prints the `git rm` to run. |
@@ -138,7 +138,7 @@ lock table). Read-only commands never write anything, registry included.
 | 1 | Tool or tofu error. |
 | 2 | `plan --detailed-exitcode` only: changes present. |
 | 3 | Policy violation (denied action, conflicting claim, identity already in the base). |
-| 4 | Overlay stale (base moved) or branch behind trunk. |
+| 4 | Overlay stale (base moved), branch behind trunk, or trunk drift on base updates (`apply` without `--accept-drift`). |
 | 5 | Registry conflict, unreachable or invalid. |
 | 6 | Base key not allowed by `policy.allowed_base_keys`, or overlay not found. |
 | 7 | Overlay frozen (status `merging`). |
@@ -186,7 +186,25 @@ binary: tofu               # or terraform; TOFU_OVERLAY_BINARY overrides
 identity: {}               # type -> [attribute paths], extends data/identity.yaml
 import_ids: {}             # type -> "{attr}/..." import id format
 virtual_attributes: {}     # type -> [write-only attrs ignored at merge verify]
+ignored_attributes: {}     # type glob -> [environment-dependent attrs, never claimed]
 ```
+
+### Trunk drift and environment-dependent attributes
+
+An overlay plan can show `update`s on base resources the branch never
+touched. Two causes, two treatments (details in [docs/LIMITS.md](docs/LIMITS.md)
+sections 13 and 14):
+
+- **trunk drift**: the base state lags the trunk config (the trunk pipeline
+  has not applied the latest trunk on that environment). `plan` computes a
+  trunk baseline (`git archive origin/<trunk>` planned against the base
+  state, cached under `.tofu-overlay/`) and lists those updates as `drift`
+  without claiming them; `apply` refuses (exit 4) until the trunk pipeline
+  runs and the overlay is rebased, or `--accept-drift` claims them;
+- **environment-dependent attributes** (`aws_lambda_function.filename`
+  under another `TF_DATA_DIR`, `last_modified`...): listed as `ignored`,
+  not claimed, still applied by tofu. Extend the list with
+  `ignored_attributes:` in `.tofu-overlay.yaml`.
 
 ### Environment variables
 

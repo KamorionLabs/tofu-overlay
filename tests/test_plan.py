@@ -122,6 +122,7 @@ def evaluate(registry_doc: RegistryDoc, knowledge, registry):
         *,
         doc: RegistryDoc | None = None,
         base_identities: set[str] | None = None,
+        trunk_drift: dict[str, list[str]] | None = None,
     ) -> PolicyResult:
         d = doc or registry_doc
         return plan.evaluate(
@@ -133,6 +134,7 @@ def evaluate(registry_doc: RegistryDoc, knowledge, registry):
             doc=d,
             knowledge=knowledge,
             registry=registry,
+            trunk_drift=trunk_drift,
         )
 
     return _run
@@ -907,3 +909,112 @@ class TestIdentityOf:
         )
         assert plan._identity_of(change, knowledge, source="before") == {"name": "/acme/token"}
         assert plan._identity_of(change, knowledge, source="after") == {}
+
+
+# ---------------------------------------------------------------- drift / ignored
+
+
+LAMBDA_BEFORE = {
+    "id": "fct-acme-dev-worker",
+    "function_name": "fct-acme-dev-worker",
+    "filename": ".terraform/modules/worker/code.zip",
+    "last_modified": "2026-09-01T00:00:00Z",
+    "memory_size": 256,
+}
+
+
+def _update(address: str, before: dict, after: dict, **kwargs: Any) -> ResourceChange:
+    return mk_change(address, ["update"], before=before, after=after, **kwargs)
+
+
+class TestIgnoredAttributesAndTrunkDrift:
+    """DESIGN §7.7 (environment-dependent attributes) and §7.8 (trunk drift)."""
+
+    def test_update_touching_only_ignored_attributes_is_not_claimed(self, evaluate) -> None:
+        after = {**LAMBDA_BEFORE, "filename": ".tofu-overlay/x/modules/worker/code.zip"}
+        change = _update(
+            "aws_lambda_function.worker", LAMBDA_BEFORE, after,
+            after_unknown={"last_modified": True},
+        )
+        result = evaluate([change])
+        assert result.ok
+        assert result.ignored == ["aws_lambda_function.worker"]
+        assert "aws_lambda_function.worker" not in result.claims
+        assert result.drift == []
+        assert any("environment-dependent" in w for w in result.warnings)
+
+    def test_wildcard_last_modified_applies_to_every_type(self, evaluate) -> None:
+        before = {"id": "sqs-acme-dev-events", "name": "sqs-acme-dev-events", "last_modified": "a"}
+        after = {**before, "last_modified": "b"}
+        result = evaluate([_update("aws_sqs_queue.events", before, after)])
+        assert result.ignored == ["aws_sqs_queue.events"]
+        assert "aws_sqs_queue.events" not in result.claims
+
+    def test_real_attribute_change_alongside_ignored_ones_is_claimed(self, evaluate) -> None:
+        after = {**LAMBDA_BEFORE, "filename": "elsewhere.zip", "memory_size": 512}
+        result = evaluate([_update("aws_lambda_function.worker", LAMBDA_BEFORE, after)])
+        assert result.ignored == []
+        claim = result.claims["aws_lambda_function.worker"]
+        assert claim.kind is ClaimKind.UPDATE
+
+    def test_ignored_rule_runs_before_drift(self, evaluate) -> None:
+        after = {**LAMBDA_BEFORE, "filename": "elsewhere.zip"}
+        change = _update("aws_lambda_function.worker", LAMBDA_BEFORE, after)
+        result = evaluate([change], trunk_drift={"aws_lambda_function.worker": ["update"]})
+        assert result.ignored == ["aws_lambda_function.worker"]
+        assert result.drift == []
+
+    def test_update_in_trunk_drift_is_not_claimed(self, evaluate) -> None:
+        before = {"id": "s3-acme-dev-logs", "bucket": "s3-acme-dev-logs", "tags": {}}
+        change = _update("aws_s3_bucket.logs", before, {**before, "tags": {"env": "dev"}})
+        result = evaluate([change], trunk_drift={"aws_s3_bucket.logs": ["update"]})
+        assert result.ok
+        assert result.drift == ["aws_s3_bucket.logs"]
+        assert "aws_s3_bucket.logs" not in result.claims
+        assert any("trunk is not applied" in w and "--accept-drift" in w for w in result.warnings)
+
+    def test_without_baseline_the_update_is_claimed(self, evaluate) -> None:
+        before = {"id": "s3-acme-dev-logs", "bucket": "s3-acme-dev-logs", "tags": {}}
+        change = _update("aws_s3_bucket.logs", before, {**before, "tags": {"env": "dev"}})
+        for trunk_drift in (None, {}, {"aws_s3_bucket.assets": ["update"]}):
+            result = evaluate([change], trunk_drift=trunk_drift)
+            assert result.drift == []
+            assert result.claims["aws_s3_bucket.logs"].kind is ClaimKind.UPDATE
+
+    def test_existing_update_claim_stays_claimed_despite_drift(self, evaluate) -> None:
+        before = {"id": "iam-acme-dev-app", "name": "iam-acme-dev-app", "description": "a"}
+        change = _update("aws_iam_role.app", before, {**before, "description": "b"})
+        result = evaluate([change], trunk_drift={"aws_iam_role.app": ["update"]})
+        assert result.drift == []
+        assert result.claims["aws_iam_role.app"].kind is ClaimKind.UPDATE
+
+    def test_delete_and_replace_in_drift_stay_denied(self, evaluate) -> None:
+        attrs = {"id": "s3-acme-dev-logs", "bucket": "s3-acme-dev-logs"}
+        changes = [
+            mk_change("aws_s3_bucket.logs", ["delete"], before=attrs),
+            mk_change("aws_sqs_queue.events", ["delete", "create"], before=attrs, after=attrs),
+        ]
+        drift = {"aws_s3_bucket.logs": ["delete"], "aws_sqs_queue.events": ["delete", "create"]}
+        result = evaluate(changes, trunk_drift=drift)
+        assert violated(result) == {"aws_s3_bucket.logs", "aws_sqs_queue.events"}
+        assert {v.rule for v in result.violations} == {"destructive"}
+        assert result.drift == []
+
+    def test_own_resource_update_is_never_drift_nor_ignored(self, evaluate) -> None:
+        before = {"id": "reports", "name": "reports", "last_modified": "a"}
+        change = _update("aws_sns_topic.reports", before, {**before, "last_modified": "b"})
+        result = evaluate([change], trunk_drift={"aws_sns_topic.reports": ["update"]})
+        assert result.ok and result.drift == [] and result.ignored == []
+        assert result.claims["aws_sns_topic.reports"].kind is ClaimKind.CREATE
+
+    def test_result_lists_are_sorted_and_serialised(self, evaluate) -> None:
+        before = {"id": "x", "bucket": "x", "tags": {}}
+        changes = [
+            _update("aws_s3_bucket.logs", before, {**before, "tags": {"a": "1"}}),
+            _update("aws_s3_bucket.assets", before, {**before, "tags": {"a": "1"}}),
+        ]
+        drift = {"aws_s3_bucket.logs": ["update"], "aws_s3_bucket.assets": ["update"]}
+        result = evaluate(changes, trunk_drift=drift)
+        assert result.drift == ["aws_s3_bucket.assets", "aws_s3_bucket.logs"]
+        dumped = result.model_dump(mode="json")
+        assert dumped["drift"] == result.drift and dumped["ignored"] == []

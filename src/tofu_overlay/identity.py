@@ -141,6 +141,7 @@ class TypeKnowledge:
         non_importable: list[str],
         replace_prone: list[str],
         virtual_attributes: dict[str, list[str]],
+        ignored_attributes: dict[str, list[str]] | None = None,
     ) -> None:
         self.identity: dict[str, list[str]] = {k: list(v) for k, v in identity.items()}
         self.import_formats: dict[str, str] = dict(import_formats)
@@ -149,6 +150,9 @@ class TypeKnowledge:
         self.virtual_attributes: dict[str, list[str]] = {
             k: list(dict.fromkeys(v)) for k, v in virtual_attributes.items()
         }
+        self.ignored_attributes: dict[str, list[str]] = {
+            k: list(dict.fromkeys(v)) for k, v in (ignored_attributes or {}).items()
+        }
 
     # ------------------------------------------------------------------ load
     @classmethod
@@ -156,8 +160,8 @@ class TypeKnowledge:
         """Load package data and merge the user configuration on top.
 
         Per-type identity lists and import formats from the user replace the
-        package entries; virtual attribute lists, ``non_importable`` and
-        ``replace_prone`` are unioned with the package lists.
+        package entries; virtual and ignored attribute lists, ``non_importable``
+        and ``replace_prone`` are unioned with the package lists.
         """
         identity_doc = _read_package_yaml(_IDENTITY_FILE)
         import_doc = _read_package_yaml(_IMPORT_IDS_FILE)
@@ -180,7 +184,13 @@ class TypeKnowledge:
         ).items():
             virtual[type_] = list(dict.fromkeys(virtual.get(type_, []) + attrs))
 
-        return cls(identity, formats, non_importable, replace_prone, virtual)
+        ignored = _as_str_list_map(import_doc.get("ignored_attributes"), "ignored_attributes")
+        for type_, attrs in _as_str_list_map(
+            cfg.ignored_attributes, "config ignored_attributes"
+        ).items():
+            ignored[type_] = list(dict.fromkeys(ignored.get(type_, []) + attrs))
+
+        return cls(identity, formats, non_importable, replace_prone, virtual, ignored)
 
     # -------------------------------------------------------------- identity
     def identity_for(self, type_: str, attrs: dict) -> dict[str, Any]:
@@ -273,13 +283,26 @@ class TypeKnowledge:
         """True when importing the type almost always leads to a replacement."""
         return self._matches(type_, self.replace_prone)
 
-    def virtual_attrs(self, type_: str) -> set[str]:
-        """Attributes that never round-trip through the provider for this type."""
+    @staticmethod
+    def _attrs_matching(type_: str, table: dict[str, list[str]]) -> set[str]:
         result: set[str] = set()
-        for pattern, attrs in self.virtual_attributes.items():
+        for pattern, attrs in table.items():
             if type_ == pattern or fnmatch.fnmatchcase(type_, pattern):
                 result.update(attrs)
         return result
+
+    def virtual_attrs(self, type_: str) -> set[str]:
+        """Attributes that never round-trip through the provider for this type."""
+        return self._attrs_matching(type_, self.virtual_attributes)
+
+    def ignored_attrs(self, type_: str) -> set[str]:
+        """Environment-dependent attributes whose lone change is not a branch change.
+
+        Patterns are globs; ``"*"`` applies to every type (``last_modified``).
+        An ``update`` on a base resource whose differing attributes all belong
+        here is not claimed (DESIGN §7.7).
+        """
+        return self._attrs_matching(type_, self.ignored_attributes)
 
     def known(self, type_: str) -> bool:
         """True when the type has an explicit import id format."""

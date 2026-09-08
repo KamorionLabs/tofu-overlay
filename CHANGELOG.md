@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Trunk drift detection (DESIGN §7.8): `OverlayService.trunk_baseline`
+  plans the trunk config (`git archive origin/<trunk>` exported under
+  `.tofu-overlay/_trunk/<sha>/`, new `trunk` module) against the base state
+  in `.tofu-overlay/_trunk-data/`, cached in `_base/trunk_baseline.json`
+  keyed by (trunk sha, base ETag). `plan.evaluate` takes `trunk_drift`; base
+  updates in the baseline are listed in `PolicyResult.drift`, not claimed,
+  shown separately by `plan` (`drift` in `--json`), warned by `check`, and
+  refused by `apply` with exit 4 (`DriftError`) unless `--accept-drift`
+  (needs `--yes` in CI), which claims them as regular updates.
+- Ignored attributes (DESIGN §7.7): `ignored_attributes` in the package data
+  (`aws_lambda_function: [filename, last_modified]`,
+  `aws_lambda_layer_version: [filename]`, `archive_file: [output_path]`,
+  `"*": [last_modified]`) and in `.tofu-overlay.yaml`;
+  `TypeKnowledge.ignored_attrs`. A base update whose differing attributes
+  are all ignored is not claimed (`PolicyResult.ignored`, `ignored` in
+  `plan --json`) and still applied. Documented in LIMITS.md §13-14.
+
 ## 0.1.1 - 2026-09-08
 
 - `scripts/install.sh`: download release assets through the API when `GITHUB_TOKEN` is set (private repositories); `install-test` workflow.

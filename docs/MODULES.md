@@ -1,6 +1,6 @@
 # Module contracts (v1)
 
-Every module implements exactly these public names with these signatures. Implementers may add private helpers. Types come from `tofu_overlay.models`. No module may import from `overlay.py`, `merge.py` or `cli.py` (those are the top of the dependency graph). Dependency order: `models` → `config`, `identity`, `state` → `store`, `backend`, `s3state`, `tofu`, `plan` → `registry` → `overlay`, `merge` → `cli`. `output` depends only on `models`. `store` depends only on `models` (it imports `s3state` lazily inside `make_store`); `backend` imports the error text from `store`. Nothing above `store` may import `s3state`: the registry, the orchestration and the CLI are typed against `store.StateStore` and obtain an implementation through `store.make_store`.
+Every module implements exactly these public names with these signatures. Implementers may add private helpers. Types come from `tofu_overlay.models`. No module may import from `overlay.py`, `merge.py` or `cli.py` (those are the top of the dependency graph). Dependency order: `models` → `config`, `identity`, `state` → `trunk`, `store`, `backend`, `s3state`, `tofu`, `plan` → `registry` → `overlay`, `merge` → `cli`. `output` depends only on `models`. `store` depends only on `models` (it imports `s3state` lazily inside `make_store`); `backend` imports the error text from `store`. Nothing above `store` may import `s3state`: the registry, the orchestration and the CLI are typed against `store.StateStore` and obtain an implementation through `store.make_store`.
 
 Conventions: Python 3.11, type hints everywhere, `from __future__ import annotations`, docstrings on public names, no `print` outside `output.py`, errors are subclasses of `models.OverlayError` carrying an `exit_code`. Comments in English. Keep functions small and testable; anything touching subprocess/boto3 must be injectable for tests.
 
@@ -8,7 +8,7 @@ Conventions: Python 3.11, type hints everywhere, `from __future__ import annotat
 
 ```python
 class ExitCode(IntEnum): OK=0; ERROR=1; CHANGES=2; POLICY=3; STALE=4; REGISTRY=5; NOT_ALLOWED=6; FROZEN=7
-class OverlayError(Exception): exit_code: ExitCode = ExitCode.ERROR   # subclasses: PolicyError(3), StaleError(4), RegistryError(5), NotAllowedError(6), FrozenError(7), ToolError(1)
+class OverlayError(Exception): exit_code: ExitCode = ExitCode.ERROR   # subclasses: PolicyError(3), StaleError(4) and its subclass DriftError(4), RegistryError(5), NotAllowedError(6), FrozenError(7), ToolError(1)
 class Status(StrEnum): CREATING, ACTIVE, APPLYING, DIRTY, MERGING, MERGED, ABANDONED, NEEDS_REVIEW
 class ClaimKind(StrEnum): CREATE, UPDATE
 class BackendConfig(BaseModel): backend_type:str="s3"; bucket:str; key:str; region:str|None; profile:str|None; dynamodb_table:str|None; use_lockfile:bool=False; encrypt:bool=True; kms_key_id:str|None; workspace:str="default"; backend_config_files:list[str]=[]
@@ -22,12 +22,12 @@ class Tombstone(BaseModel): status:Status; at:str; branch:str; pending_revert:li
 class RegistryDoc(BaseModel): version:int=1; tool_version:str; base:dict (bucket,key,lineage:str|None); overlays:dict[str,Overlay]={}; tombstones:dict[str,Tombstone]={}
     # helpers: live_overlays()->dict[str,Overlay]
 class PolicyConfig(BaseModel): allowed_base_keys:list[str]=[]; trunk_branch:str="main"; env_dir_glob:str="stacks/*/env/*"; tombstone_days:int=14; apply_timeout_min:int=90; max_overlay_age_days:int=30
-class ToolConfig(BaseModel): policy:PolicyConfig; binary:str="tofu"; identity:dict[str,list[str]]={}; import_ids:dict[str,str]={}; virtual_attributes:dict[str,list[str]]={}; non_importable:list[str]=[]; replace_prone:list[str]=[]
+class ToolConfig(BaseModel): policy:PolicyConfig; binary:str="tofu"; identity:dict[str,list[str]]={}; import_ids:dict[str,str]={}; virtual_attributes:dict[str,list[str]]={}; ignored_attributes:dict[str,list[str]]={}; non_importable:list[str]=[]; replace_prone:list[str]=[]
 class ResourceChange(BaseModel): address; previous_address:str|None; module_address:str|None; mode:str|None; type; name; index:Any; deposed:str|None; actions:list[str]; before:Any; after:Any; after_unknown:Any; before_sensitive:Any; after_sensitive:Any; replace_paths:list; importing:dict|None; action_reason:str|None   # mode ("managed"/"data") is authoritative for data-source detection
 class PlanSummary(BaseModel): create:int=0; update:int=0; delete:int=0; replace:int=0; import_:int=0 (alias "import"); no_op:int=0
 class Violation(BaseModel): address:str; rule:str; message:str; other_overlay:str|None
 class RemoteStateRef(BaseModel): name:str; bucket:str|None; key:str|None; region:str|None; unresolved:bool=False   # one data "terraform_remote_state" (s3) block; unresolved -> key None
-class PolicyResult(BaseModel): violations:list[Violation]; warnings:list[str]; claims:dict[str,Claim]  # claims to acquire on apply
+class PolicyResult(BaseModel): violations:list[Violation]; warnings:list[str]; claims:dict[str,Claim]; drift:list[str]=[]; ignored:list[str]=[]  # claims to acquire on apply; drift = base updates classified as trunk drift (not claimed, DESIGN §7.8); ignored = base updates touching only environment-dependent attributes (not claimed, §7.7)
     # ok -> bool
 class BackendInfo / misc small models as needed.
 def utcnow_iso() -> str
@@ -38,7 +38,7 @@ def new_run_id() -> str  (uuid4 hex[:12])
 
 ```python
 def find_repo_root(start: Path) -> Path | None          # git toplevel via `git rev-parse --show-toplevel`, else walk up for .git
-def load_config(start: Path) -> ToolConfig                # merges .tofu-overlay.yaml (walk up to repo root) over defaults; env TOFU_OVERLAY_BINARY overrides binary
+def load_config(start: Path) -> ToolConfig                # merges .tofu-overlay.yaml (walk up to repo root) over defaults; env TOFU_OVERLAY_BINARY overrides binary; `import_ids: {formats:, non_importable:, replace_prone:, virtual_attributes:, ignored_attributes:}` is lifted to the flat fields
 def is_ci() -> bool                                        # CI=true or TF_BUILD=True (case-insensitive)
 def is_ado() -> bool                                       # TF_BUILD=True
 def current_branch(cwd: Path) -> str                       # git branch --show-current; ToolError if detached/none
@@ -51,6 +51,20 @@ def resolve_overlay_name(explicit: str|None, cwd: Path) -> str   # --name > TOFU
 def git_user_email(cwd: Path) -> str
 def base_key_allowed(key: str, policy: PolicyConfig) -> bool     # fnmatch over allowed_base_keys; empty list -> False
 def ensure_gitignored(repo_root: Path, entry: str) -> bool        # True if `.tofu-overlay/` is ignored (git check-ignore); never edits files
+```
+
+## trunk.py
+
+Trunk baseline helpers (DESIGN §7.8). Depends on `config` (git runner) and `models`.
+
+```python
+EXPORT_MARKER = ".tofu-overlay-export"                      # written at the root of a finished export, holds the sha
+def trunk_sha(repo_root: Path, trunk_ref: str, runner: Runner|None = None) -> str | None   # `git rev-parse --verify <ref>^{commit}`; None when unknown locally
+def export_trunk_tree(repo_root: Path, trunk_ref: str, dest: Path, *, runner=None, bytes_runner=None) -> str
+    # `git archive --format=tar <sha>` extracted into dest with tarfile (symlinks kept, never a worktree: some modules probe .git/HEAD); returns the sha; ToolError on unknown ref / archive failure
+def trunk_env_dir(dest: Path, repo_root: Path, cwd: Path) -> Path   # dest / (cwd relative to repo_root); tolerant to one side being resolved; ToolError when cwd is outside
+def ensure_trunk_export(repo_root: Path, trunk_ref: str, cache_root: Path, *, runner=None, bytes_runner=None) -> tuple[Path, str]
+    # export once per sha under cache_root/<sha>/ (EXPORT_MARKER marks a finished export, an interrupted one is rebuilt), remove every other sha; returns (export_dir, sha)
 ```
 
 ## backend.py
@@ -172,7 +186,7 @@ def strip_sensitive(after: Any, after_sensitive: Any) -> Any  # remove keys mark
 
 ```python
 class TypeKnowledge:
-    def __init__(self, identity: dict[str,list[str]], import_formats: dict[str,str], non_importable: list[str], replace_prone: list[str], virtual_attributes: dict[str,list[str]])
+    def __init__(self, identity: dict[str,list[str]], import_formats: dict[str,str], non_importable: list[str], replace_prone: list[str], virtual_attributes: dict[str,list[str]], ignored_attributes: dict[str,list[str]] | None = None)
     @classmethod
     def load(cls, cfg: ToolConfig) -> "TypeKnowledge"       # package data YAML merged with cfg overrides (user wins)
     FALLBACK_IDENTITY_ATTRS = ("name","bucket","identifier","function_name","domain_name","cluster_identifier","cluster_id","replication_group_id","key")
@@ -182,8 +196,11 @@ class TypeKnowledge:
     def is_importable(self, type_: str) -> bool             # not in non_importable (glob patterns like "random_*")
     def is_replace_prone(self, type_: str) -> bool
     def virtual_attrs(self, type_: str) -> set[str]
+    def ignored_attrs(self, type_: str) -> set[str]         # environment-dependent attributes (DESIGN §7.7); glob patterns, "*" applies to every type; package `ignored_attributes:` unioned with cfg.ignored_attributes
     def known(self, type_: str) -> bool                     # type has an explicit import format
 ```
+
+`data/import_ids.yaml` also carries `ignored_attributes:` with at least `aws_lambda_function: [filename, last_modified]`, `aws_lambda_layer_version: [filename]`, `archive_file: [output_path]` and `"*": [last_modified]`.
 
 `data/identity.yaml` and `data/import_ids.yaml` must cover at least: aws_s3_bucket*, aws_iam_role/policy/user, aws_iam_role_policy (`{role}:{name}`), aws_iam_role_policy_attachment (`{role}/{policy_arn}`), aws_iam_user_policy_attachment, aws_lambda_function/permission (`{function_name}/{statement_id}`)/alias/layer_version(replace_prone), aws_route53_record (`{zone_id}_{name}_{type}` + `_{set_identifier}`), aws_route53_zone, aws_cloudwatch_log_group, aws_cloudwatch_event_rule/target (`{event_bus_name}/{rule}/{target_id}`), aws_scheduler_schedule (`{group_name}/{name}`), aws_sqs_queue, aws_sns_topic, aws_dynamodb_table, aws_ecr_repository, aws_secretsmanager_secret, aws_ssm_parameter, aws_kms_key/alias, aws_security_group, aws_vpc_security_group_ingress_rule/egress_rule, aws_security_group_rule (format documented as complex, mark replace_prone-like "manual"), aws_lb/lb_target_group/lb_listener/lb_listener_rule, aws_db_instance, aws_rds_cluster, aws_elasticache_*, aws_eks_cluster/node_group/addon, aws_eks_pod_identity_association (`{cluster_name},{association_id}`), aws_eks_access_entry, aws_cloudfront_distribution/cache_policy/function, aws_acm_certificate, aws_acm_certificate_validation (non_importable), aws_wafv2_web_acl (`{id}/{name}/{scope}`), aws_wafv2_web_acl_association (`{web_acl_arn},{resource_arn}`), aws_api_gateway_rest_api/resource/method/integration/deployment/stage, aws_apigatewayv2_api, aws_cognito_user_pool/client, aws_s3_object (`{bucket}/{key}`), aws_route (`{route_table_id}_{destination_cidr_block}`), aws_route_table_association (`{subnet_id}/{route_table_id}`), aws_efs_file_system, aws_backup_*, aws_kms_grant (`{key_id}:{grant_id}`), aws_cloudwatch_log_subscription_filter (`{log_group_name}|{name}`), kubernetes_namespace, kubernetes_service_account_v1 (`{metadata.0.namespace}/{metadata.0.name}`), kubernetes_manifest (non_importable in v1), helm_release (`{namespace}/{name}`), random_* / null_resource / terraform_data / time_sleep / tls_private_key / local_file / archive_file / aws_lambda_invocation / aws_iam_policy_attachment / aws_lb_target_group_attachment / aws_dynamodb_table_item / aws_iam_access_key (non_importable). virtual_attributes: aws_lambda_function [filename, source_code_hash, publish, skip_destroy], aws_s3_bucket [force_destroy], aws_iam_role [force_detach_policies], aws_ecr_repository [force_delete], aws_kms_key [deletion_window_in_days, bypass_policy_lockout_safety_check], aws_db_instance/aws_rds_cluster [master_password, skip_final_snapshot, apply_immediately, final_snapshot_identifier, allow_major_version_upgrade], aws_secretsmanager_secret [recovery_window_in_days, force_overwrite_replica_secret], helm_release [values, set, wait, timeout, cleanup_on_fail], kubernetes_* [wait_for_default_secret, wait_for_rollout].
 
@@ -192,9 +209,10 @@ class TypeKnowledge:
 ```python
 def parse_plan(show_json: dict) -> tuple[list[ResourceChange], list[dict], PlanSummary]   # resource_changes, resource_drift, summary
 def is_base_address(address: str, base_addresses: set[str]) -> bool
-def evaluate(changes: list[ResourceChange], drift: list[dict], *, base_addresses: set[str], base_identities: set[str], me: Overlay, doc: RegistryDoc, knowledge: TypeKnowledge, registry: Registry) -> PolicyResult
-    # implements DESIGN §7 items 2-6; claims: create -> Claim(kind=create, identity from strip_sensitive(after)...), update on base -> Claim(kind=update, after_hash=sha256(json(after)))
-    # existing own claims are kept; an update on an address already claimed by me is fine
+def evaluate(changes: list[ResourceChange], drift: list[dict], *, base_addresses: set[str], base_identities: set[str], me: Overlay, doc: RegistryDoc, knowledge: TypeKnowledge, registry: Registry, trunk_drift: dict[str, list[str]] | None = None) -> PolicyResult
+    # implements DESIGN §7 items 2-8; claims: create -> Claim(kind=create, identity from strip_sensitive(after)...), update on base -> Claim(kind=update, after_hash=sha256(json(after)))
+    # existing own claims are kept; an update on an address already claimed by me is fine (and never drift)
+    # per base update, in this order: differing attributes all in knowledge.ignored_attrs(type) -> PolicyResult.ignored, no claim; address in trunk_drift -> PolicyResult.drift, no claim; else update claim. One warning per non-empty list. trunk_drift None = no baseline, nothing is drift. delete/replace on base addresses stay denied
 def verify_import_plan(changes: list[ResourceChange], *, me: Overlay, knowledge: TypeKnowledge, allow_import_updates: bool, accepted_recreate: set[str]|None = None) -> tuple[bool, list[str], list[str]]   # DESIGN §8: (ok, errors, warnings)
 def guard_trunk_plan(changes: list[ResourceChange], *, doc: RegistryDoc, knowledge: TypeKnowledge, overlay_states: dict[str, dict] | None) -> list[Violation]   # DESIGN §6 guard
 def render_summary(summary: PlanSummary) -> str
@@ -219,14 +237,15 @@ class Console:
 ```python
 class OverlayService:
     def __init__(self, cwd: Path, cfg: ToolConfig, backend: BackendConfig, console: Console, *, name: str | None = None, session=None, runner_factory=None)
-    # properties: name, registry, store (StateStore built by store.make_store(backend, session=session)), knowledge, data_dir (.tofu-overlay/<name>), base_data_dir (.tofu-overlay/_base), repo_root
+    # properties: name, registry, store (StateStore built by store.make_store(backend, session=session)), knowledge, data_dir (.tofu-overlay/<name>), base_data_dir (.tofu-overlay/_base), trunk_cache_dir (.tofu-overlay/_trunk), trunk_data_dir (.tofu-overlay/_trunk-data), repo_root
     # remote-state lookups on other bases build their store through make_store as well; archive detection uses backend.is_archive_key, prefix scans backend.overlay_prefix()
     def create(self, *, force_name: bool = False) -> Overlay
-    def plan(self, *, extra: list[str] = [], allow_behind: bool = False, detailed_exitcode: bool = False) -> tuple[PolicyResult, PlanSummary, Path, bool]   # (policy, summary, planfile, stale)
-    def apply(self, *, auto_approve: bool, allow_stale: bool, allow_behind: bool, extra: list[str] = [], yes: bool = False) -> Overlay   # console.confirm before acquire_claims unless auto_approve/yes; plan file unlinked afterwards
+    def plan(self, *, extra: list[str] = [], allow_behind: bool = False, detailed_exitcode: bool = False, accept_drift: bool = False) -> tuple[PolicyResult, PlanSummary, Path, bool]   # (policy, summary, planfile, stale); the trunk baseline is computed only when the policy produced a new update claim; with accept_drift the baseline is informative (warning listing the accepted addresses) and every base update is claimed
+    def apply(self, *, auto_approve: bool, allow_stale: bool, allow_behind: bool, extra: list[str] = [], yes: bool = False, accept_drift: bool = False) -> Overlay   # console.confirm before acquire_claims unless auto_approve/yes; plan file unlinked afterwards; DriftError(4) when policy.drift is non-empty without accept_drift; PolicyError when accept_drift in CI without yes
+    def trunk_baseline(self, refresh: bool = False) -> dict[str, list[str]] | None   # address -> actions of a plan of the trunk config (trunk.ensure_trunk_export under trunk_cache_dir, trunk.trunk_env_dir) against the base state, runner rooted at the exported env dir with trunk_data_dir (init on the base key, no overlay variables); cached in base_data_dir/trunk_baseline.json keyed by (trunk sha, base ETag); plan file deleted after show -json; None + warning when origin/<trunk> is unknown, the export fails or the env dir is absent on the trunk; a failing tofu plan raises. Read-only
     def status(self) -> dict                                 # JSON-able
     def list(self) -> list[dict]
-    def check(self) -> tuple[bool, list[str], list[str]]     # (ok, errors, warnings); "no overlay for branch" -> (True, [], ["no overlay"])
+    def check(self) -> tuple[bool, list[str], list[str]]     # (ok, errors, warnings); "no overlay for branch" -> (True, [], ["no overlay"]); trunk drift (trunk_baseline non-empty) and a failing baseline are warnings
     def rebase(self, *, yes: bool) -> Overlay
     def abandon(self, *, keep_resources: bool, dry_run: bool, yes: bool) -> None
     def finalize(self, *, purge: bool, yes: bool) -> None
@@ -253,4 +272,4 @@ def guard(plan_json_path: Path, *, registry: Registry, knowledge: TypeKnowledge)
 
 ## cli.py
 
-Typer app `tofu-overlay` with commands: create, plan, apply, status, list, check, rebase, merge, finalize, abandon, doctor, guard, gc, version. Never imports `s3state`: `guard` and `list --prefix` obtain their store through `store.make_store(cfg, session=INJECT["session"])`. Global options: `-C/--chdir`, `--name`, `--backend-config` (repeatable), `--bucket/--key/--region/--profile/--dynamodb-table`, `--json`, `--no-color`, `--yes`, `--print-backend`, `-v/--verbose`. Every command: build Console, resolve backend, echo backend line (not in `--json`), enforce allowed_base_keys for mutating commands, map `OverlayError.exit_code` to the process exit code, unexpected exceptions → exit 1 with message. `plan` passes anything after `--` to tofu after `validate_passthrough`.
+Typer app `tofu-overlay` with commands: create, plan, apply (`--accept-drift`, refused in CI without `--yes`), status, list, check, rebase, merge, finalize, abandon, doctor, guard, gc, version. `plan --json` carries top-level `drift` and `ignored` lists next to `policy`. Never imports `s3state`: `guard` and `list --prefix` obtain their store through `store.make_store(cfg, session=INJECT["session"])`. Global options: `-C/--chdir`, `--name`, `--backend-config` (repeatable), `--bucket/--key/--region/--profile/--dynamodb-table`, `--json`, `--no-color`, `--yes`, `--print-backend`, `-v/--verbose`. Every command: build Console, resolve backend, echo backend line (not in `--json`), enforce allowed_base_keys for mutating commands, map `OverlayError.exit_code` to the process exit code, unexpected exceptions → exit 1 with message. `plan` passes anything after `--` to tofu after `validate_passthrough`.

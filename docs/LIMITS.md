@@ -219,3 +219,60 @@ The missing pieces are the checks above and the base-side write path.
   4, 5, 6.
 
 Every deferred item, backends included, is tracked in [ROADMAP.md](ROADMAP.md).
+
+## 13. Trunk drift is detected, not resolved
+
+The overlay plans the branch config against a copy of the base state. When
+the base state lags the trunk config (the trunk pipeline has not applied the
+latest trunk on that environment), the overlay plan shows `update`s on base
+resources that the branch never touched: a trunk plan would show them too.
+Claiming and applying them from the overlay would silently do the trunk's
+work under the branch's name, and the registry would then block the trunk
+(`guard`) or another branch on those addresses.
+
+The tool computes a **trunk baseline**: `git archive origin/<trunk>` exported
+under `.tofu-overlay/_trunk/<sha>/` (never a worktree) and planned from the
+same relative env dir against the base state (`.tofu-overlay/_trunk-data/`,
+read-only, cached per trunk sha and base ETag). A base `update` that the
+baseline also reports is classified as **drift**: not claimed, listed by
+`plan` (`drift:` lines, `drift` in `--json`), warned by `check`, and `apply`
+refuses with exit 4. The fix is the trunk pipeline (apply the trunk on that
+environment) followed by `rebase`; `apply --accept-drift` (with `--yes` in
+CI) claims the drifted addresses as regular updates when the branch really
+owns that change.
+
+Caveats:
+
+- the baseline is only computed when the overlay plan holds a new `update`
+  on a base address (and by `check`), and it is skipped with a warning when
+  `origin/<trunk>` is unknown locally, the export fails or the env dir does
+  not exist on the trunk: every base update is then claimed as before;
+- the baseline runs the trunk config with the same binary, providers and
+  credentials as the overlay, without the overlay variables
+  (`TF_VAR_tofu_overlay_*`), like the trunk pipeline would. A trunk config
+  that cannot plan locally (missing `--backend-config`, provider auth) makes
+  `plan` fail; `--accept-drift` degrades that failure to a warning;
+- `git archive` does not export submodules nor files marked
+  `export-ignore`;
+- a branch that changes a resource the trunk also changed is classified as
+  drift for that resource: `--accept-drift` is the way to claim it;
+- `delete`/replace of base resources stay denied whatever the baseline says
+  (overlays are additive).
+
+## 14. Environment-dependent attributes are applied, not skipped
+
+Some attributes depend on where tofu runs rather than on the configuration:
+`aws_lambda_function.filename` stored in the base state as
+`.terraform/modules/x/code.zip` differs from the path the overlay computes
+under its own `TF_DATA_DIR`; `archive_file.output_path`, `last_modified`
+timestamps. An `update` on a base resource whose differing attributes are
+all in `ignored_attributes` for its type (packaged defaults plus
+`.tofu-overlay.yaml`) is not a branch change: it is not claimed, `plan`
+lists it (`ignored:` lines, `ignored` in `--json`) and warns once.
+
+The change is still part of the tofu plan and gets applied on the overlay:
+tofu cannot leave one change out of a plan without `-target`, which the tool
+rejects. This is harmless by construction (the attribute is write-only or
+informational), but it means the overlay state carries the overlay's local
+path for that resource; the trunk state keeps its own. If a real attribute
+changes alongside an ignored one, the update is claimed as usual.
