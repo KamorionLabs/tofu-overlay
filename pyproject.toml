@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kmr-tofu-overlay"
-version = "0.1.0"
+version = "0.1.1"
 description = "Copy-on-write state overlays for OpenTofu/Terraform: apply a branch on a shared environment without polluting the trunk state, with cross-overlay conflict detection and resource claims."
 readme = "README.md"
 requires-python = ">=3.11"

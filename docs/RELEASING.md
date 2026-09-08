@@ -30,9 +30,9 @@ No API token is stored anywhere.
 
 | Where | Command |
 |---|---|
-| Laptop (uv) | `uv tool install kmr-tofu-overlay` (after PyPI is enabled) or `uv tool install git+https://github.com/KamorionLabs/tofu-overlay@v0.1.0` |
+| Laptop (uv) | `uv tool install kmr-tofu-overlay` (after PyPI is enabled) or `uv tool install git+https://github.com/KamorionLabs/tofu-overlay@v0.1.1` |
 | Laptop (pipx) | `pipx install kmr-tofu-overlay` |
-| Linux CI agent, no Python required | `curl -fsSL https://raw.githubusercontent.com/KamorionLabs/tofu-overlay/main/scripts/install.sh \| sh -s -- 0.1.0` |
+| Linux CI agent, no Python required | `curl -fsSL https://raw.githubusercontent.com/KamorionLabs/tofu-overlay/main/scripts/install.sh \| sh -s -- 0.1.1` |
 | Private repository | same, with `GITHUB_TOKEN` set (read access to releases) |
 
 The binary needs `tofu` (or `terraform`) on the `PATH`, like the Python package.

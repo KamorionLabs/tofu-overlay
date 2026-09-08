@@ -4,7 +4,11 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.1.1 - 2026-09-08
+
+- `scripts/install.sh`: download release assets through the API when `GITHUB_TOKEN` is set (private repositories); `install-test` workflow.
+
+## 0.1.0 - 2026-09-08
 
 ### Added
 

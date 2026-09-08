@@ -45,11 +45,27 @@ case "$OS/$ARCH" in
   *) echo "no prebuilt binary for $OS/$ARCH; use TOFU_OVERLAY_METHOD=pypi" >&2; exit 1 ;;
 esac
 
-BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-curl -fsSL ${AUTH:+-H "$AUTH"} -o "$TMP/$ASSET" "$BASE/$ASSET"
-curl -fsSL ${AUTH:+-H "$AUTH"} -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"
+
+# Public repository: plain release download URLs. Private repository (GITHUB_TOKEN set):
+# browser download URLs return 404, assets must be fetched through the API asset URL.
+download_asset() {
+  name="$1"; dest="$2"
+  if [ -n "$AUTH" ]; then
+    url="$(curl -fsSL -H "$AUTH" "https://api.github.com/repos/${REPO}/releases/tags/v${VERSION}" \
+      | tr ',' '\n' | grep -B0 -A0 '"url": *"https://api.github.com/repos/[^"]*/releases/assets/[0-9]*"' \
+      | sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' | while read -r u; do
+          curl -fsSL -H "$AUTH" "$u" | grep -q "\"name\": *\"$name\"" && echo "$u" && break
+        done)"
+    [ -n "$url" ] || { echo "asset $name not found in release v${VERSION}" >&2; exit 1; }
+    curl -fsSL -H "$AUTH" -H "Accept: application/octet-stream" -o "$dest" "$url"
+  else
+    curl -fsSL -o "$dest" "https://github.com/${REPO}/releases/download/v${VERSION}/${name}"
+  fi
+}
+download_asset "$ASSET" "$TMP/$ASSET"
+download_asset "SHA256SUMS" "$TMP/SHA256SUMS"
 EXPECTED="$(grep " $ASSET\$" "$TMP/SHA256SUMS" | cut -d' ' -f1)"
 ACTUAL="$(sha256sum "$TMP/$ASSET" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
 [ "$EXPECTED" = "$ACTUAL" ] || { echo "checksum mismatch for $ASSET" >&2; exit 1; }
