@@ -1,0 +1,608 @@
+{
+ "format_version": "1.2",
+ "terraform_version": "1.11.1",
+ "variables": {
+  "env": {
+   "value": "dev"
+  },
+  "tofu_overlay_name": {
+   "value": "feature-abc-12-reports-3f9a1c"
+  }
+ },
+ "planned_values": {
+  "root_module": {
+   "resources": [],
+   "child_modules": [
+    {
+     "address": "module.net",
+     "resources": []
+    }
+   ]
+  }
+ },
+ "resource_changes": [
+  {
+   "address": "aws_s3_bucket.reports",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "reports",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "bucket": "s3-acme-dev-reports",
+     "force_destroy": true,
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true,
+     "region": true
+    },
+    "before_sensitive": false,
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.flags[\"c\"]",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "flags",
+   "index": "c",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "/acme/dev/flags/c",
+     "type": "String",
+     "value": "on"
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true,
+     "version": true
+    },
+    "before_sensitive": false,
+    "after_sensitive": {
+     "value": true
+    }
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.token",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "token",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "/acme/dev/token",
+     "type": "SecureString",
+     "value": "s3cr3t-value"
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true,
+     "version": true
+    },
+    "before_sensitive": false,
+    "after_sensitive": {
+     "value": true
+    }
+   }
+  },
+  {
+   "address": "module.net.aws_security_group.reports",
+   "module_address": "module.net",
+   "mode": "managed",
+   "type": "aws_security_group",
+   "name": "reports",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "description": "reports",
+     "name": "nsg-acme-dev-reports",
+     "vpc_id": "vpc-0123456789abcdef0",
+     "ingress": [
+      {
+       "from_port": 443,
+       "to_port": 443,
+       "protocol": "tcp",
+       "cidr_blocks": [
+        "10.0.0.0/8"
+       ]
+      }
+     ]
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true,
+     "ingress": [
+      {}
+     ]
+    },
+    "before_sensitive": false,
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_sqs_queue.dynamic",
+   "mode": "managed",
+   "type": "aws_sqs_queue",
+   "name": "dynamic",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": null,
+     "fifo_queue": false
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true,
+     "name": true,
+     "url": true
+    },
+    "before_sensitive": false,
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_iam_role.app",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "app",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "arn": "arn:aws:iam::123456789012:role/iam-acme-dev-app",
+     "description": "Application role",
+     "id": "iam-acme-dev-app",
+     "name": "iam-acme-dev-app",
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after": {
+     "arn": "arn:aws:iam::123456789012:role/iam-acme-dev-app",
+     "description": "Application role (reports)",
+     "id": "iam-acme-dev-app",
+     "name": "iam-acme-dev-app",
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_cloudwatch_log_group.reports",
+   "mode": "managed",
+   "type": "aws_cloudwatch_log_group",
+   "name": "reports",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "arn": "arn:aws:logs:eu-west-1:123456789012:log-group:/aws/lambda/fct-acme-dev-reports",
+     "id": "/aws/lambda/fct-acme-dev-reports",
+     "name": "/aws/lambda/fct-acme-dev-reports",
+     "retention_in_days": 14
+    },
+    "after": {
+     "arn": "arn:aws:logs:eu-west-1:123456789012:log-group:/aws/lambda/fct-acme-dev-reports",
+     "id": "/aws/lambda/fct-acme-dev-reports",
+     "name": "/aws/lambda/fct-acme-dev-reports",
+     "retention_in_days": 30
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_cloudwatch_log_group.reports",
+   "mode": "managed",
+   "type": "aws_cloudwatch_log_group",
+   "name": "reports",
+   "deposed": "8a2f1c9e",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete"
+    ],
+    "before": {
+     "arn": "arn:aws:logs:eu-west-1:123456789012:log-group:/aws/lambda/fct-acme-dev-reports-old",
+     "id": "/aws/lambda/fct-acme-dev-reports-old",
+     "name": "/aws/lambda/fct-acme-dev-reports-old",
+     "retention_in_days": 14
+    },
+    "after": null,
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_sns_topic.reports",
+   "mode": "managed",
+   "type": "aws_sns_topic",
+   "name": "reports",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create",
+     "delete"
+    ],
+    "before": {
+     "arn": "arn:aws:sns:eu-west-1:123456789012:sns-acme-dev-reports",
+     "id": "arn:aws:sns:eu-west-1:123456789012:sns-acme-dev-reports",
+     "name": "sns-acme-dev-reports",
+     "fifo_topic": false
+    },
+    "after": {
+     "name": "sns-acme-dev-reports.fifo",
+     "fifo_topic": true
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {},
+    "replace_paths": [
+     [
+      "fifo_topic"
+     ]
+    ]
+   },
+   "action_reason": "replace_because_cannot_update"
+  },
+  {
+   "address": "aws_s3_bucket.logs",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "logs",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete"
+    ],
+    "before": {
+     "arn": "arn:aws:s3:::s3-acme-dev-logs",
+     "bucket": "s3-acme-dev-logs",
+     "force_destroy": false,
+     "id": "s3-acme-dev-logs",
+     "region": "eu-west-1",
+     "tags": {}
+    },
+    "after": null,
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "action_reason": "delete_because_no_resource_config"
+  },
+  {
+   "address": "aws_lambda_function.worker",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "worker",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "arn": "arn:aws:lambda:eu-west-1:123456789012:function:fct-acme-dev-worker",
+     "function_name": "fct-acme-dev-worker",
+     "handler": "index.handler",
+     "id": "fct-acme-dev-worker",
+     "memory_size": 256,
+     "runtime": "python3.12"
+    },
+    "after": {
+     "function_name": "fct-acme-dev-worker-v2",
+     "handler": "index.handler",
+     "memory_size": 256,
+     "runtime": "python3.12"
+    },
+    "after_unknown": {
+     "arn": true,
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {},
+    "replace_paths": [
+     [
+      "function_name"
+     ]
+    ]
+   },
+   "action_reason": "replace_because_cannot_update"
+  },
+  {
+   "address": "aws_s3_bucket.assets",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "assets",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "forget"
+    ],
+    "before": {
+     "arn": "arn:aws:s3:::s3-acme-dev-assets",
+     "bucket": "s3-acme-dev-assets",
+     "force_destroy": false,
+     "id": "s3-acme-dev-assets",
+     "region": "eu-west-1",
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after": null,
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "action_reason": "delete_because_no_resource_config"
+  },
+  {
+   "address": "aws_sqs_queue.events",
+   "mode": "managed",
+   "type": "aws_sqs_queue",
+   "name": "events",
+   "deposed": "3c4d5e6f",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete"
+    ],
+    "before": {
+     "arn": "arn:aws:sqs:eu-west-1:123456789012:sqs-acme-dev-events-old",
+     "id": "https://sqs.eu-west-1.amazonaws.com/123456789012/sqs-acme-dev-events-old",
+     "name": "sqs-acme-dev-events-old"
+    },
+    "after": null,
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_route53_record.www_v2",
+   "previous_address": "aws_route53_record.www",
+   "mode": "managed",
+   "type": "aws_route53_record",
+   "name": "www_v2",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "fqdn": "www.acme.example",
+     "id": "Z0123456789ABCDEFGHIJ_www.acme.example_A",
+     "name": "www.acme.example",
+     "records": [
+      "192.0.2.10"
+     ],
+     "ttl": 300,
+     "type": "A",
+     "zone_id": "Z0123456789ABCDEFGHIJ",
+     "set_identifier": null
+    },
+    "after": {
+     "fqdn": "www.acme.example",
+     "id": "Z0123456789ABCDEFGHIJ_www.acme.example_A",
+     "name": "www.acme.example",
+     "records": [
+      "192.0.2.10"
+     ],
+     "ttl": 300,
+     "type": "A",
+     "zone_id": "Z0123456789ABCDEFGHIJ",
+     "set_identifier": null
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_s3_bucket.adopted",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "adopted",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "arn": "arn:aws:s3:::s3-acme-dev-adopted",
+     "bucket": "s3-acme-dev-adopted",
+     "force_destroy": false,
+     "id": "s3-acme-dev-adopted",
+     "region": "eu-west-1",
+     "tags": {}
+    },
+    "after": {
+     "arn": "arn:aws:s3:::s3-acme-dev-adopted",
+     "bucket": "s3-acme-dev-adopted",
+     "force_destroy": false,
+     "id": "s3-acme-dev-adopted",
+     "region": "eu-west-1",
+     "tags": {}
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {},
+    "importing": {
+     "id": "s3-acme-dev-adopted"
+    }
+   }
+  },
+  {
+   "address": "aws_instance.bastion[0]",
+   "mode": "managed",
+   "type": "aws_instance",
+   "name": "bastion",
+   "index": 0,
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "ami": "ami-0123456789abcdef0",
+     "id": "i-0123456789abcdef0",
+     "instance_type": "t3.micro",
+     "tags": {
+      "Name": "sv-acme-dev-bastion-001"
+     }
+    },
+    "after": {
+     "ami": "ami-0123456789abcdef0",
+     "id": "i-0123456789abcdef0",
+     "instance_type": "t3.micro",
+     "tags": {
+      "Name": "sv-acme-dev-bastion-001"
+     }
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "data.aws_caller_identity.current",
+   "mode": "data",
+   "type": "aws_caller_identity",
+   "name": "current",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "read"
+    ],
+    "before": null,
+    "after": {
+     "account_id": "123456789012",
+     "id": "123456789012"
+    },
+    "after_unknown": {
+     "arn": true,
+     "user_id": true
+    },
+    "before_sensitive": false,
+    "after_sensitive": {}
+   }
+  }
+ ],
+ "resource_drift": [
+  {
+   "address": "aws_iam_role.app",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "app",
+   "provider_name": "registry.opentofu.org/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "arn": "arn:aws:iam::123456789012:role/iam-acme-dev-app",
+     "description": "Application role",
+     "id": "iam-acme-dev-app",
+     "name": "iam-acme-dev-app",
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after": {
+     "arn": "arn:aws:iam::123456789012:role/iam-acme-dev-app",
+     "description": "Application role (trunk edit)",
+     "id": "iam-acme-dev-app",
+     "name": "iam-acme-dev-app",
+     "tags": {
+      "env": "dev"
+     }
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  }
+ ],
+ "prior_state": {
+  "format_version": "1.0",
+  "terraform_version": "1.11.1",
+  "values": {
+   "root_module": {
+    "resources": []
+   }
+  }
+ },
+ "configuration": {
+  "provider_config": {
+   "aws": {
+    "name": "aws",
+    "full_name": "registry.opentofu.org/hashicorp/aws",
+    "expressions": {
+     "region": {
+      "constant_value": "eu-west-1"
+     }
+    }
+   }
+  },
+  "root_module": {
+   "resources": [],
+   "variables": {
+    "env": {
+     "default": "dev"
+    },
+    "tofu_overlay_name": {
+     "default": ""
+    }
+   }
+  }
+ },
+ "relevant_attributes": [
+  {
+   "resource": "aws_iam_role.app",
+   "attribute": [
+    "arn"
+   ]
+  }
+ ],
+ "timestamp": "2026-09-08T09:15:42Z",
+ "errored": false
+}

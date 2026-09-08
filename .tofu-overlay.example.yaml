@@ -1,0 +1,79 @@
+# .tofu-overlay.yaml -- example configuration for tofu-overlay.
+#
+# Copy this file to the root of the repository as `.tofu-overlay.yaml`.
+# The tool finds it by walking up from the current directory to the git
+# top-level. Every key is optional; the values shown are the defaults unless
+# a comment says otherwise. See docs/DESIGN.md section 10.
+
+policy:
+  # Base state keys on which overlays may be created (fnmatch globs against
+  # the S3 key, without the bucket). Default is an empty list = deny all;
+  # a base key outside this list makes every command exit 6.
+  # Keep sandboxes only here: never list production keys.
+  allowed_base_keys:
+    - "acme/webshop/*/dev"
+    - "acme/*/sandbox"
+
+  # Trunk branch. Overlays must contain origin/<trunk_branch> (checked with
+  # `git merge-base --is-ancestor`), otherwise plan/apply refuse.
+  trunk_branch: main
+
+  # Glob (relative to the repository root) locating the stack env directories
+  # scanned by `status --repo` and `check --repo`.
+  env_dir_glob: "stacks/*/env/*"
+
+  # Days a merged/abandoned overlay name stays in the tombstones; `create`
+  # refuses a tombstoned name without --force-name.
+  tombstone_days: 14
+
+  # An overlay stuck in status `applying` longer than this is treated as
+  # `dirty` (the apply process died without reporting).
+  apply_timeout_min: 90
+
+  # Overlays older than this are flagged by `status`, `doctor` and `gc`.
+  # Informational: nothing is destroyed automatically.
+  max_overlay_age_days: 30
+
+# Binary used for every run: "tofu" (default) or "terraform".
+# The TOFU_OVERLAY_BINARY environment variable overrides this value.
+binary: tofu
+
+# Identity attributes per resource type, merged over the package's
+# data/identity.yaml (user entries win). The identity is the set of
+# attributes that name the physical object; it is what two overlays must not
+# both create, and what must not already exist in the base state.
+# Paths use "a.0.b" for nested blocks.
+identity:
+  # A custom provider's resource with a compound identity.
+  acme_widget: [region, name]
+  # Override the packaged rule for a type.
+  kubernetes_config_map_v1: [metadata.0.namespace, metadata.0.name]
+
+# Import id formats per resource type, merged over data/import_ids.yaml
+# (user entries win). Placeholders are attribute names or dotted paths read
+# from the overlay state at merge time. Types with no format default to
+# "{id}" with a warning at merge.
+import_ids:
+  acme_widget: "{region}/{name}"
+  kubernetes_config_map_v1: "{metadata.0.namespace}/{metadata.0.name}"
+
+# Write-only attributes that legitimately differ between an imported object
+# and its configuration. Merge verification ignores an `update` on a created
+# resource when every differing attribute is listed here for its type.
+# Merged over the packaged list (user entries are added).
+virtual_attributes:
+  acme_widget: [apply_immediately]
+  aws_lambda_function: [filename, source_code_hash, publish, skip_destroy]
+
+# Resource types that cannot be handed to the trunk by `import {}` blocks.
+# `merge` lists them and refuses unless --accept-recreate names the address.
+# Glob patterns are accepted ("random_*"). Added to the packaged list.
+non_importable:
+  - "acme_ephemeral_*"
+
+# Resource types whose import is followed by a replacement in the verify
+# plan (the provider cannot reconcile the imported object with the config).
+# Refused up-front by `merge` like non-importable types. Added to the
+# packaged list.
+replace_prone:
+  - acme_widget_version

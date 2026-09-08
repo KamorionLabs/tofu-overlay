@@ -14,15 +14,15 @@ class ClaimKind(StrEnum): CREATE, UPDATE
 class BackendConfig(BaseModel): bucket:str; key:str; region:str|None; profile:str|None; dynamodb_table:str|None; use_lockfile:bool=False; encrypt:bool=True; kms_key_id:str|None; workspace:str="default"; backend_config_files:list[str]=[]
     # helpers: state_path() -> str (== key for default ws); overlay_key(name)->str; registry_key()->str; archive_key(name, status, ts)->str; lock_id(path)->str ("<bucket>/<path>"); md5_lock_id(path)->str ("<bucket>/<path>-md5")
     # extension-aware: "a/b/terraform.tfstate" -> overlay "a/b/terraform@NAME.tfstate", registry "a/b/terraform.overlays.json", archive "a/b/terraform@NAME.merged-TS.tfstate"
-class Claim(BaseModel): kind:ClaimKind; type:str; identity:dict[str,Any]={}; id:str|None; import_id:str|None; after_hash:str|None; claimed_at:str; updated_at:str
+class Claim(BaseModel): kind:ClaimKind; type:str; identity:dict[str,Any]={}; id:str|None; import_id:str|None; after_hash:str|None; dependencies:list[str]=[]; claimed_at:str; updated_at:str   # dependencies: state `dependencies` of a created instance, recorded at apply (guard)
 class Overlay(BaseModel): name; state_key; lineage:str|None; branch; owners:list[str]; caller_arn:str|None; binary:str="tofu"; tofu_version:str|None; created_at; updated_at; base_serial:int|None; base_etag:str|None; trunk_commit:str|None; status:Status; applied_commit:str|None; run_id:str|None; applying_since:str|None; claims:dict[str,Claim]={}; pending_revert:list[str]=[]; last_apply:dict|None
     # helpers: is_live()->bool (creating/active/applying/dirty/merging); create_claims()->dict[str,Claim]; update_claims()->dict[str,Claim]
-class Tombstone(BaseModel): status:Status; at:str; branch:str
+class Tombstone(BaseModel): status:Status; at:str; branch:str; pending_revert:list[str]=[]
 class RegistryDoc(BaseModel): version:int=1; tool_version:str; base:dict (bucket,key,lineage:str|None); overlays:dict[str,Overlay]={}; tombstones:dict[str,Tombstone]={}
     # helpers: live_overlays()->dict[str,Overlay]
 class PolicyConfig(BaseModel): allowed_base_keys:list[str]=[]; trunk_branch:str="main"; env_dir_glob:str="stacks/*/env/*"; tombstone_days:int=14; apply_timeout_min:int=90; max_overlay_age_days:int=30
 class ToolConfig(BaseModel): policy:PolicyConfig; binary:str="tofu"; identity:dict[str,list[str]]={}; import_ids:dict[str,str]={}; virtual_attributes:dict[str,list[str]]={}; non_importable:list[str]=[]; replace_prone:list[str]=[]
-class ResourceChange(BaseModel): address; previous_address:str|None; module_address:str|None; type; name; index:Any; deposed:str|None; actions:list[str]; before:Any; after:Any; after_unknown:Any; after_sensitive:Any; replace_paths:list; importing:dict|None; action_reason:str|None
+class ResourceChange(BaseModel): address; previous_address:str|None; module_address:str|None; mode:str|None; type; name; index:Any; deposed:str|None; actions:list[str]; before:Any; after:Any; after_unknown:Any; before_sensitive:Any; after_sensitive:Any; replace_paths:list; importing:dict|None; action_reason:str|None   # mode ("managed"/"data") is authoritative for data-source detection
 class PlanSummary(BaseModel): create:int=0; update:int=0; delete:int=0; replace:int=0; import_:int=0 (alias "import"); no_op:int=0
 class Violation(BaseModel): address:str; rule:str; message:str; other_overlay:str|None
 class PolicyResult(BaseModel): violations:list[Violation]; warnings:list[str]; claims:dict[str,Claim]  # claims to acquire on apply
@@ -95,9 +95,10 @@ class Registry:
     def conflicts_for(self, doc: RegistryDoc, me: str, wanted: dict[str, Claim]) -> list[Violation]   # checks 3 and 4 of DESIGN §7 against every live overlay except `me`
     def acquire_claims(self, name: str, wanted: dict[str, Claim], run_id: str, base_etag: str) -> RegistryDoc
         # single update(): overlay must be live & not frozen; base_etag must equal overlay.base_etag; conflicts_for must be empty else PolicyError; set claims (idempotent), status APPLYING, run_id, applying_since
-    def finish_apply(self, name: str, *, ok: bool, claims: dict[str, Claim], applied_commit: str|None, caller_arn: str|None, tofu_version: str|None, base_etag_after: str|None, summary: dict) -> RegistryDoc
-    def set_status(self, name: str, status: Status, **fields) -> RegistryDoc
-    def release_overlay(self, name: str, final: Status) -> RegistryDoc   # move to tombstones
+    def finish_apply(self, name: str, *, ok: bool, claims: dict[str, Claim], applied_commit: str|None, caller_arn: str|None, tofu_version: str|None, base_etag_after: str|None, summary: dict, run_id: str|None = None, released: Iterable[str] = ()) -> RegistryDoc
+        # RegistryError when run_id is given and differs from the entry's (superseded apply); `released` create claims are dropped on ok=True only
+    def set_status(self, name: str, status: Status, *, expect_status: Iterable[Status]|None = None, expect_entry: Overlay|None = None, **fields) -> RegistryDoc   # preconditions checked inside the CAS closure: status in expect_status, entry identical to expect_entry as loaded (RegistryError, FrozenError if merging); `claims` merged set-by-key
+    def release_overlay(self, name: str, final: Status, *, pending_revert: Iterable[str]|None = None, expect_status: Iterable[Status]|None = None) -> RegistryDoc   # move to tombstones, pending_revert kept (defaults to the entry's)
     def tombstoned(self, doc: RegistryDoc, name: str, days: int) -> bool
     def stale_applying(self, ov: Overlay, timeout_min: int) -> bool
 ```
@@ -114,7 +115,7 @@ class TofuRunner:
     def needs_init(self, key: str) -> bool                  # data_dir/terraform.tfstate missing or its backend key != key or lock file changed
     def plan(self, out: Path, *, extra: list[str] = [], destroy: bool = False, targets: list[str] = [], refresh: bool = True) -> int   # returns exit code (0/2 with -detailed-exitcode); raises ToolError on 1
     def show_json(self, planfile: Path) -> dict
-    def apply(self, planfile: Path, *, auto_approve: bool) -> None
+    def apply(self, planfile: Path, *, auto_approve: bool = True) -> None   # streams; a saved plan never prompts, confirmation is the caller's job; TF_CLI_ARGS* dropped from the env
     def state_pull(self) -> dict
     def state_push(self, doc: dict, *, force: bool = False) -> None   # writes temp file, `state push [-force] FILE`
     def state_rm(self, addresses: list[str]) -> None
@@ -165,7 +166,7 @@ def is_base_address(address: str, base_addresses: set[str]) -> bool
 def evaluate(changes: list[ResourceChange], drift: list[dict], *, base_addresses: set[str], base_identities: set[str], me: Overlay, doc: RegistryDoc, knowledge: TypeKnowledge, registry: Registry) -> PolicyResult
     # implements DESIGN §7 items 2-6; claims: create -> Claim(kind=create, identity from strip_sensitive(after)...), update on base -> Claim(kind=update, after_hash=sha256(json(after)))
     # existing own claims are kept; an update on an address already claimed by me is fine
-def verify_import_plan(changes: list[ResourceChange], *, me: Overlay, knowledge: TypeKnowledge, allow_import_updates: bool) -> tuple[bool, list[str], list[str]]   # DESIGN §8: (ok, errors, warnings)
+def verify_import_plan(changes: list[ResourceChange], *, me: Overlay, knowledge: TypeKnowledge, allow_import_updates: bool, accepted_recreate: set[str]|None = None) -> tuple[bool, list[str], list[str]]   # DESIGN §8: (ok, errors, warnings)
 def guard_trunk_plan(changes: list[ResourceChange], *, doc: RegistryDoc, knowledge: TypeKnowledge, overlay_states: dict[str, dict] | None) -> list[Violation]   # DESIGN §6 guard
 def render_summary(summary: PlanSummary) -> str
 ```
@@ -192,7 +193,7 @@ class OverlayService:
     # properties: name, registry, s3, knowledge, data_dir (.tofu-overlay/<name>), base_data_dir (.tofu-overlay/_base), repo_root
     def create(self, *, force_name: bool = False) -> Overlay
     def plan(self, *, extra: list[str] = [], allow_behind: bool = False, detailed_exitcode: bool = False) -> tuple[PolicyResult, PlanSummary, Path, bool]   # (policy, summary, planfile, stale)
-    def apply(self, *, auto_approve: bool, allow_stale: bool, allow_behind: bool, extra: list[str] = []) -> Overlay
+    def apply(self, *, auto_approve: bool, allow_stale: bool, allow_behind: bool, extra: list[str] = [], yes: bool = False) -> Overlay   # console.confirm before acquire_claims unless auto_approve/yes; plan file unlinked afterwards
     def status(self) -> dict                                 # JSON-able
     def list(self) -> list[dict]
     def check(self) -> tuple[bool, list[str], list[str]]     # (ok, errors, warnings); "no overlay for branch" -> (True, [], ["no overlay"])
@@ -215,7 +216,7 @@ class MergeService:
     def __init__(self, svc: OverlayService)
     def merge(self, *, allow_import_updates: bool, accept_recreate: list[str], allow_unapplied: bool, yes: bool) -> Path
     def undo(self, *, yes: bool) -> None
-    def verify(self) -> tuple[bool, list[str], list[str]]    # plan branch config against base state in base data dir, then plan.verify_import_plan
+    def verify(self, *, accepted: set[str]|None = None) -> tuple[bool, list[str], list[str]]    # plan branch config against base state in base data dir, then plan.verify_import_plan; accepted defaults to the create claims absent from the imports file
 def guard(plan_json_path: Path, *, registry: Registry, knowledge: TypeKnowledge) -> list[Violation]
 ```
 
