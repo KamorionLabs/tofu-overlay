@@ -1,163 +1,194 @@
-# tofu-overlay — design
+# tofu-overlay — design (v1)
 
-Status: draft v0 (2026-09-08). Target: OpenTofu >= 1.7 (import/removed blocks), Terraform >= 1.5 best effort.
+Status: v1 spec, 2026-09-08, after a three-lens adversarial review of the v0 draft (Terraform semantics, concurrency/safety, operability). Target: OpenTofu >= 1.7 with the `s3` backend (DynamoDB lock and/or `use_lockfile`). Terraform >= 1.5 best effort. Workspaces other than `default`, the `azurerm` backend and state encryption surgery are out of scope for v1 (detected and refused).
 
 ## 1. Problem
 
-Several teams work in parallel on the same OpenTofu root modules ("stacks"), each stack having **one state per environment** (S3 + DynamoDB lock). The integration environment is a shared sandbox. Today the only way to test a branch on the sandbox is to run `apply` from that branch against the shared state, which:
-
-- writes the branch's resources into the shared state, so the next apply from the trunk destroys them;
-- lets two branches revert each other's changes on shared resources;
-- gives no visibility on "who is currently changing what" in the sandbox.
-
-Trunk-based development with per-environment gating fixes the promotion problem, but not the "I want to apply my branch on the sandbox before merging" problem.
+Several teams work in parallel on the same OpenTofu root modules ("stacks"), each stack having one state per environment (S3 + DynamoDB lock). The integration environment is a shared sandbox. Today the only way to test a branch on the sandbox is to run `apply` from that branch against the shared state, which writes the branch's resources into the shared state (the next trunk apply destroys them), lets two branches revert each other's changes on shared resources, and gives no visibility on who is changing what in the sandbox.
 
 ## 2. Idea
 
-An **overlay** is a copy-on-write fork of a base state, bound to a git branch and a name:
+An **overlay** is a copy-on-write fork of a base state, bound to a git branch:
 
-- `create` copies the base state object (`<key>`) to `<key>@<overlay>` in the same bucket. Serial and lineage are preserved, so the overlay plans only the branch's delta.
-- `plan`/`apply` run the regular OpenTofu binary against the overlay state (backend `key` override + separate `TF_DATA_DIR`), after **policy checks** computed from the plan JSON and a shared **registry**.
-- The registry records, per base state, every active overlay and its **claims**: resources it creates (address + planned/actual physical identity) and resources it updates.
-- `merge` hands the overlay's created resources to the base state, by default through generated `import` blocks committed with the branch (visible and reviewable in the PR), alternatively by direct state surgery under the DynamoDB lock.
-- `abandon` destroys only the overlay's delta and drops the overlay.
+- `create` forks the base state into `<key>@<name>` (new lineage, same content), so the overlay plans only the branch's delta.
+- `plan`/`apply` run the regular OpenTofu binary against the overlay state, after **policy checks** computed from the plan JSON and a shared **registry**.
+- The registry records, per base state, every overlay and its **claims**: resources it creates (address + physical identity) and base resources it updates. Claims are held until the overlay is finalized or abandoned, so two overlays can never create the same resource nor update the same base resource.
+- `merge` hands the overlay's created resources to the trunk through generated `import {}` blocks committed with the branch, verified with a plan against the base state.
+- `abandon` destroys only the overlay's own resources.
 
-Scope is deliberately **additive**: an overlay may *create* resources and, with an exclusive claim, *update* base resources. It may not destroy or replace base resources (policy `destructive: deny`, overridable to `exclusive` which requires that no other overlay exists on the stack).
+Scope is **additive**: an overlay may create resources and, with an exclusive claim, update base resources. It may not destroy, replace, move, forget or import base resources.
 
-The cloud has no branches. Two overlays can only run in parallel when their cloud changes are disjoint at **resource granularity** (update APIs take the whole object). The registry + claims enforce that.
+The cloud has no branches: two overlays can run in parallel only when their cloud changes are disjoint at resource granularity. The registry enforces that. The tool does not protect an overlay's *updates* from a trunk apply (the trunk config does not know the overlay); `check` detects it and asks for a rebase.
 
-## 3. Non-goals
+## 3. Invariants (the safety core)
 
-- Attribute-level concurrency on a single resource (CloudFront distribution, WAF ACL, node group...). Those serialize.
-- Protecting overlay *updates* from a base apply: the trunk's config does not know the overlay, so a base apply reverts the overlay's updates in the cloud. `check` detects this drift and asks for a rebase.
-- Managing environments other than the base (no promotion logic).
-- Replacing state locking: OpenTofu's own DynamoDB lock still applies to each state key.
+1. **State objects are only written by OpenTofu.** Every read of a state is `tofu state pull`, every write is `tofu state push` (or `apply`), run in a dedicated `TF_DATA_DIR` whose backend points at the target key. This keeps the DynamoDB `-md5` digest item, the lock protocol, `use_lockfile`, lineage/serial checks and state encryption consistent. The only raw S3 operations on state keys are `HEAD` (ETag, existence), `ListObjects` (doctor), `CopyObject` to an archive key and `DeleteObject` (+ `DeleteItem` of the `-md5` item and `.tflock`) at finalize/abandon.
+2. **The base state is never written by the tool** in v1. The trunk adopts overlay resources through `import {}` blocks applied by the trunk pipeline.
+3. **The registry stores intention, the overlay state stores reality.** Ids, import ids and identities are recomputed from the overlay state whenever they matter (status, check, merge, finalize, abandon). Registry values are a cache.
+4. **Claims live until `finalize` or `abandon`.** Statuses `creating`, `active`, `applying`, `dirty`, `merging` all count in conflict checks.
+5. **`plan`, `check`, `status`, `list`, `doctor`, `guard`, `gc` never write anything** (registry included). Only `create`, `apply`, `rebase`, `merge`, `finalize`, `abandon` write, and each prints the resolved backend and what it is about to do.
+6. **Overlays are only allowed on base keys matching `policy.allowed_base_keys`** (globs, default deny). Exit code 6 otherwise.
+7. **Every tofu run validates the overlay first**: registry entry exists with a live status, `HEAD` of the overlay key succeeds, the lineage pulled from the overlay state equals the registry's `lineage`, the current git branch equals the overlay's `branch` (or `--name` was given explicitly). A missing key is never treated as an empty state.
+8. **Freshness** = the base ETag read by `HEAD` equals the overlay's `base_etag` (serial is informative only). `apply` refuses stale overlays; `plan` warns. Additionally the branch must contain the trunk (`git merge-base --is-ancestor origin/<trunk> HEAD`), else `plan`/`apply` refuse unless `--allow-behind` (never in CI).
+9. **Pass-through arguments** `-target`, `-replace`, `-refresh-only`, `-destroy`, `-state`, `-lock=false` are rejected for `plan`/`apply`.
 
 ## 4. Vocabulary
 
-- **base**: the trunk state, `bucket/key` (e.g. `acme/webshop/storage/dev`).
-- **overlay**: `bucket/key@<name>`; `<name>` = `[a-z0-9][a-z0-9-]{0,40}` (derived from the branch by default: `feature/ABC-12-foo` → `abc-12-foo`).
-- **registry**: JSON document `bucket/<key>.overlays.json` (sibling of the base state), updated with S3 conditional writes (`IfMatch` ETag, `IfNoneMatch: *` on creation). No new infrastructure. Optional DynamoDB registry backend later.
-- **claim**: an entry in the registry that reserves a resource address (and its physical identity) for one overlay. Kinds: `create`, `update`. `destructive` is only allowed with an exclusive stack claim.
-- **freshness**: an overlay records the base `serial` (and ETag) it was copied from. If the base moved, the overlay is *stale*: `plan` warns, `apply` refuses (unless `--allow-stale`, never in CI).
+- **base**: the trunk state `s3://<bucket>/<key>`, default workspace only.
+- **overlay key**: `<key>@<name>`; if `<key>` has an extension the suffix goes before it (`terraform@<name>.tfstate`). `<name>` = `<slug(branch)[:34]>-<sha1(branch)[:6]>`, or `--name`/`TOFU_OVERLAY_NAME`. The name is recomputed from the branch on every run; there is no `current` file.
+- **registry key**: `<key>.overlays.json` (extension-aware: `terraform.overlays.json`). One JSON document per base, S3 conditional writes (`IfMatch` ETag; `IfNoneMatch: *` on creation, only when no `<key>@*` object exists).
+- **archive key**: `<key>@<name>.<status>-<timestamp>` used by `finalize`/`abandon` instead of deleting the overlay state outright (`gc --purge` deletes archives later).
+- **data dirs**: `.tofu-overlay/<name>/` (overlay) and `.tofu-overlay/_base/` (base, read-only use: `state pull`, verify plans). `TF_PLUGIN_CACHE_DIR` defaults to `~/.cache/tofu-overlay/plugins`. The tool warns if `.tofu-overlay/` is not git-ignored.
 
 ## 5. Registry document
 
 ```json
 {
   "version": 1,
-  "base": {"bucket": "acme-tfstate", "key": "acme/webshop/storage/dev"},
+  "tool_version": "0.1.0",
+  "base": {"bucket": "acme-tfstate", "key": "acme/webshop/storage/dev", "lineage": "…"},
   "overlays": {
-    "abc-12-foo": {
-      "state_key": "acme/webshop/storage/dev@abc-12-foo",
-      "branch": "feature/ABC-12-foo",
-      "owner": "jean@example.com",
-      "created_at": "2026-09-08T09:00:00Z",
-      "updated_at": "2026-09-08T09:30:00Z",
-      "base_serial": 412,
-      "base_etag": "\"9c1...\"",
-      "status": "active",             // active | dirty | merging | merged | abandoned
-      "exclusive": false,
+    "abc-12-reports-3f9a1c": {
+      "state_key": "acme/webshop/storage/dev@abc-12-reports-3f9a1c",
+      "lineage": "…",
+      "branch": "feature/ABC-12-reports",
+      "owners": ["jean@example.com"],
+      "caller_arn": "arn:aws:sts::123456789012:assumed-role/…",
+      "binary": "tofu", "tofu_version": "1.11.1",
+      "created_at": "…", "updated_at": "…",
+      "base_serial": 412, "base_etag": "\"9c1…\"", "trunk_commit": "…",
+      "status": "active",
+      "applied_commit": "…", "run_id": null,
       "claims": {
-        "aws_s3_bucket.reports": {
-          "kind": "create",
-          "type": "aws_s3_bucket",
-          "identity": {"bucket": "s3-acme-dev-reports"},
-          "id": "s3-acme-dev-reports",          // filled after apply
-          "import_id": "s3-acme-dev-reports",   // filled after apply
-          "claimed_at": "2026-09-08T09:10:00Z"
-        },
-        "aws_iam_role.reports": {"kind": "update", "type": "aws_iam_role", "identity": {"name": "iam-acme-dev-reports"}, "claimed_at": "..."}
+        "aws_s3_bucket.reports": {"kind": "create", "type": "aws_s3_bucket",
+          "identity": {"bucket": "s3-acme-dev-reports"}, "id": "s3-acme-dev-reports",
+          "import_id": "s3-acme-dev-reports", "claimed_at": "…", "updated_at": "…"},
+        "aws_iam_role.reports": {"kind": "update", "type": "aws_iam_role",
+          "identity": {"name": "iam-acme-dev-reports"}, "after_hash": "…", "claimed_at": "…"}
       },
-      "last_plan": {"at": "...", "summary": {"create": 3, "update": 1}, "stale": false}
+      "pending_revert": [],
+      "last_apply": {"at": "…", "summary": {"create": 3, "update": 1}}
     }
-  }
+  },
+  "tombstones": {"old-name-1a2b3c": {"status": "merged", "at": "…"}}
 }
 ```
 
-Registry writes go through `Registry.update(fn)` = get (ETag) → mutate → put with `IfMatch` → retry on 412 with backoff (bounded). Every conflict check runs **inside** that critical section when it leads to a write (claim acquisition), so two overlays cannot both acquire the same claim.
+Statuses: `creating` → `active` ⇄ `applying` → `active` | `dirty`; `active`/`dirty` → `merging` → `merged`; `active`/`dirty` → `abandoned`. `merged`/`abandoned` entries move to `tombstones` and stay `policy.tombstone_days` (default 14); `create` refuses a tombstoned name without `--force-name`.
 
-## 6. Commands
+| status | plan | apply | rebase | merge | finalize | abandon |
+|---|---|---|---|---|---|---|
+| creating | refuse (resume `create`) | refuse | refuse | refuse | refuse | allowed (cleanup) |
+| active | yes | yes | yes | yes | refuse | yes |
+| applying (younger than `policy.apply_timeout_min`) | refuse | refuse | refuse | refuse | refuse | refuse |
+| applying (older) | treated as dirty | | | | | |
+| dirty | yes | yes (retry) | refuse | refuse | refuse | yes |
+| merging | verify mode only | refuse (exit 7) | refuse | `--undo` only | yes | `--keep-resources` only |
+| merged / abandoned | refuse | refuse | refuse | refuse | refuse | refuse |
 
-All commands run from the stack's env directory (where the `backend "s3"` block lives) and discover the backend from the HCL (`state.tf`/`backend.tf`), from `-backend-config` files, or from flags/env (`TOFU_OVERLAY_BUCKET`, `_KEY`, `_REGION`, `_PROFILE`, `_DYNAMODB_TABLE`).
+`Registry.update(fn)`: GET (ETag) → `fn(doc)` (must be idempotent: set-by-key, never append) → PUT `IfMatch` → on 412/409 re-GET and retry with bounded backoff; when the budget is exhausted, re-GET once and succeed if the mutation is already present. Fail-closed on missing (when overlay objects exist), invalid or newer-version documents. `base.lineage` is checked against the pulled base state; a lineage change invalidates every overlay (status `needs-review`, mutating commands refuse).
 
-| Command | What it does |
+## 6. Commands and exit codes
+
+All commands run from the stack's env directory (`-C/--chdir` accepted). Backend resolution order: flags/env (`TOFU_OVERLAY_BUCKET`, `_KEY`, `_REGION`, `_PROFILE`, `_DYNAMODB_TABLE`) > `--backend-config FILE` (repeatable, same files the pipeline uses) > cached backend in `.terraform/terraform.tfstate` > HCL `backend "s3"` block in `*.tf`. Unresolved values, `azurerm`, non-default workspaces (`TF_WORKSPACE`, `.terraform/environment`) → error with a clear message. The resolved tuple is echoed first; `--print-backend` prints it and exits.
+
+| Command | Effect |
 |---|---|
-| `create [NAME] [--branch B] [--base-overlay P]` | Copy base → overlay key (server-side `CopyObject`), register overlay (status `active`), write local `.tofu-overlay/current` with the name. Refuses if an active overlay with that name exists. `--base-overlay` = stacked overlay (see §10), recorded as `parent`. |
-| `plan [-- tofu args]` | `init -reconfigure -backend-config=key=<overlay>` in `TF_DATA_DIR=.tofu-overlay/<name>`, `plan -out -detailed-exitcode`, `show -json` → **policy checks** (§7). Prints the plan summary and the verdict. Exit 0 = ok, 2 = changes, 3 = policy violation, 4 = stale. |
-| `apply [--auto-approve]` | Re-run checks, **acquire claims atomically** in the registry, `apply tfplan`, then pull the overlay state and fill `id`/`import_id`/actual identity for every `create` claim. On apply failure: status `dirty`, claims kept. |
-| `status` / `list` | Show overlays of this base: owner, branch, freshness (base serial vs current), claims, status. `--json`. |
-| `check` | Non-mutating CI gate: overlay fresh? claims still valid vs base (no base resource with the same address/identity appeared)? no conflicting overlay? Exit non-zero on problems. Meant for PR build validation. |
-| `rebase` | Base moved: re-copy base → overlay key, re-inject the overlay's `create` claims (instances copied from the previous overlay state, or import blocks) into the fresh copy, bump serial, push. Then `plan` must show only the overlay's `update` claims (or nothing). Conflict if the new base contains an address or identity claimed by the overlay. |
-| `merge [--strategy import\|state] [--out FILE]` | `import` (default): write `overlay_<name>_imports.tf` in the env dir with one `import {}` block per `create` claim (import id from the mapping in §8), then **verify** with a plan against the *base* state (`-refresh=false` off, real refresh on): every import must be `importing` with no other change; otherwise print the offenders and fall back suggestion. Marks the overlay `merging`. `state`: pull base under a manual DynamoDB lock, insert the overlay's `create` instances (address-disjoint check), bump serial, push, mark `merged`. |
-| `finalize` | After the trunk applied the imports: verify base contains every claimed address, delete overlay key, mark `merged`, optionally delete the imports file. |
-| `abandon [--keep-resources]` | `destroy -target=<addr>` for every `create` claim in dependency order (tofu handles ordering), release claims, delete overlay key, mark `abandoned`. `update` claims are released without action; the next base apply reverts them (documented). |
-| `gc` | Remove overlays whose branch no longer exists on the remote (`--dry-run` default). |
+| `create [--name N] [--force-name]` | Register `creating` (CAS), pull base (base data dir), set new lineage, serial 0 → push to the overlay key (overlay data dir, `init -reconfigure -backend-config=key=<overlay>` with the original backend-config files first and `key` last), record `base_etag`/`base_serial`/`trunk_commit`, flip to `active`. Refuses: base key not allowed, name active, tombstoned name, `<key>@<name>` object or `-md5` item already present outside the registry (run `doctor`), base object missing (no `--empty-base` in v1). Re-running resumes a `creating` entry. |
+| `plan [--json] [--detailed-exitcode] [-- tofu args]` | Validate overlay (§3.7), freshness and git ancestry, `init` if needed, `plan -out=tfplan.<run_id> -detailed-exitcode`, `show -json`, policy checks (§7). Read-only. In status `merging`: verify mode (§8). |
+| `apply [--auto-approve] [--allow-stale]` | `plan` then: mark `applying` + `run_id` (CAS, refuse if base moved), **acquire claims atomically** (re-run checks 3-5 inside the CAS), `apply tfplan`, pull overlay state, fill `id`/`import_id`/identity from state (filtered by `after_sensitive`), record `applied_commit`, `caller_arn`, `tofu_version`, re-read base ETag (moved → stale), status `active` (or `dirty` on failure; claims kept). Uses tofu's own prompt; `--auto-approve` only in CI or with `--yes`. |
+| `status [--json] [--repo]` / `list [--json]` | Overlays of this base (or every base under `policy.env_dir_glob` with `--repo`), owners, branch, freshness, status, claims, age, pending reverts. Read-only. `list --bucket B --prefix P` scans `*.overlays.json` without a checkout. |
+| `check [--json] [--repo]` | CI gate, read-only: overlay exists for the branch (else exit 0 with a "no overlay" line), fresh, branch contains trunk, every `create` claim has an instance in the overlay state, no base resource with a claimed address/identity appeared, no conflicting overlay, imports file (if any) matches the claims. |
+| `rebase` | Refuse if stale-only is false, status not `active`, or the branch is behind trunk. Pull base and overlay, build the new document locally (base content + overlay's `create` instances merged per resource entry, `provider` equality and `schema_version` checks, overlay lineage kept, serial = max + 1), conflict checks against the new base (address, identity), one `state push` to the overlay key, then update `base_etag`/`base_serial`/`trunk_commit`. Typed confirmation. Previous overlay state archived (`.rebase-<ts>`). |
+| `merge [--undo] [--allow-import-updates] [--accept-recreate ADDR,…] [--allow-unapplied]` | Import strategy only in v1. Refuse if dirty, HEAD != `applied_commit` or dirty tree (unless `--allow-unapplied`), or any `create` claim is non-importable (listed, unless accepted for recreation). Write `zz_overlay_<name>.imports.tf` in the env dir (must not be a symlink; sorted; header with overlay, base key/ETag, commit, per-block identity), verify (§8), status `merging`. `--undo` deletes the file and returns to `active`. |
+| `finalize [--purge]` | Precondition: the trunk applied the imports. Pull base: every `create` claim must be present with the same `id` (an address present with a different id = the trunk created its own object → refuse with report). Archive the overlay key (copy to archive key, delete object + `-md5` item + `.tflock`), remove local data dir, status `merged` → tombstone. Prints the `git rm` for the imports file (never edits the trunk). Typed confirmation. |
+| `abandon [--keep-resources] [--dry-run]` | Refuse in `merging`/`merged` (except `--keep-resources`). Verify no `create` claim identity is present in the base (else "already merged, run finalize"). Sequence: `state rm` every address that is not a `create` claim from the overlay state (so base resources can never be destroyed), `plan -destroy -out`, gate: only `delete` actions on `create` claims (deposed included), `apply`, pull state, verify the addresses are gone, archive key, release claims, record `pending_revert` for `update` claims and print the trunk pipeline to run, remove local data dir, status `abandoned`. `--keep-resources` skips the destroy and prints the orphaned ids. Typed confirmation; `--dry-run` prints every S3/DynamoDB/tofu operation. |
+| `doctor` | Read-only report: overlay objects `<key>@*` absent from the registry, registry entries whose key is missing, orphan `-md5` items and `.tflock`s, stale `applying`, tombstones, `.tofu-overlay/` not git-ignored, tofu version vs `.opentofu-version`, imports files whose overlay is merged. |
+| `guard PLAN_JSON` | For the trunk pipeline, read-only: fails if the trunk plan creates an identity claimed by an overlay, deletes/replaces an address under an `update` claim, or deletes an address that an overlay's `create` instances depend on. |
+| `gc [--purge]` | Report overlays whose branch no longer exists on the remote, and archives. `--purge` deletes archive objects only (typed confirmation). Never destroys cloud resources. |
 
-`TF_VAR_tofu_overlay_name` is exported to every tofu run so configs may make cross-stack `terraform_remote_state` keys overlay-aware if they wish.
+Exit codes (all commands): 0 ok (changes are reported, not signalled), 1 tool/tofu error, 3 policy violation, 4 stale or behind trunk, 5 registry conflict/unreachable/invalid, 6 base key not allowed or overlay not found, 7 overlay frozen (`merging`). `--detailed-exitcode` on `plan` restores 2 for "changes present". CI = `CI=true` or `TF_BUILD=True`: no colour, `##vso[task.logissue]` lines on ADO, `--allow-stale`/`--allow-behind` refused, `--yes` accepted for `apply`. `--json` output on `plan`, `check`, `status`, `list`, `doctor` (versioned `schema: 1`).
 
-## 7. Policy checks (from `tofu show -json tfplan`)
+`TF_VAR_tofu_overlay_name` is exported to every tofu run (ignored when undeclared).
 
-For each `resource_changes[]` entry (address, type, `change.actions`, `change.before/after`, `after_unknown`):
+## 7. Policy checks (plan JSON)
 
-1. **Freshness**: current base serial == recorded `base_serial`, else *stale*.
-2. **Additive policy**:
-   - `["create"]` → allowed. Claim `create`.
-   - `["update"]` on an address present in the base state → allowed only with an exclusive `update` claim. Address absent from base (i.e. created earlier by this overlay) → allowed, no new claim.
-   - `["delete"]`, `["delete","create"]`, `["create","delete"]` on a base address → **denied** by default. With `--destructive exclusive`: allowed only if this overlay is the *only* active overlay on the stack and it takes the `exclusive` flag. Replacement of a resource created by this overlay → allowed.
+Input: `resource_changes[]` (address, `previous_address`, `deposed`, type, `change.actions`, `before`, `after`, `after_unknown`, `after_sensitive`, `replace_paths`, `importing`, `action_reason`), `resource_drift[]`, the set of base addresses (from the base state pulled at `create`/`rebase`, cached in the overlay data dir and refreshed on demand), the registry, and the type knowledge.
+
+1. Freshness (§3.8).
+2. Actions, explicit allow-list; anything else is denied:
+   - `["create"]` → allowed; claim `create` (identity from `after`, minus sensitive attributes; unknown identity → address-only claim + warning).
+   - `["update"]` on a base address → allowed with an `update` claim (exclusive). On an address created by this overlay → allowed, no claim.
    - `["no-op"]`, `["read"]` → ignored.
-3. **Address conflict**: another active overlay claims the same address (any kind) → denied.
-4. **Identity conflict**: another active overlay's `create` claim has the same physical identity (per-type identity attributes, §8) → denied even if the address differs. Unknown identity (`after_unknown`) → address check only, warning.
-5. **Base identity conflict**: a `create` whose identity already exists in the base state → denied (would fail at apply with AlreadyExists, or worse, silently adopt).
-6. **Drift on own updates**: for each `update` claim, if the plan shows the resource being changed *back* (before != what the overlay applied last) the base likely reverted it → warning "rebase required".
+   - `["delete"]`, `["delete","create"]`, `["create","delete"]`, `["forget"]`, `["forget","create"]` on a base address → denied. On an address created by this overlay → allowed (replace of own resource).
+   - `previous_address` set (moved) on a base address → denied. `importing` set on an address (branch `import {}` block) → denied (an overlay adopts nothing). `deposed` entries → allowed only for `create` claims.
+3. Address conflict: another live overlay claims the address (any kind) → denied.
+4. Identity conflict: another live overlay's `create` claim has the same identity → denied.
+5. Base identity conflict: a `create` whose identity already exists in the base state → denied.
+6. Drift on own updates (warning): `resource_drift[]` entry for an `update` claim whose refreshed value differs from `after_hash` recorded at apply → "the trunk (or someone) changed it, rebase".
 
-Checks 3-5 are recomputed under the registry critical section at claim time.
+Checks 3-5 are recomputed inside the registry critical section when claims are acquired.
 
-## 8. Type knowledge (data-driven, YAML, user-extensible)
+## 8. Merge verification (import strategy)
 
-`identity.yaml`: `type → [attributes]` used as the physical identity (e.g. `aws_s3_bucket: [bucket]`, `aws_route53_record: [zone_id, name, type, set_identifier]`, `aws_iam_role_policy_attachment: [role, policy_arn]`, `kubernetes_namespace: [metadata.0.name]`). Generic fallback: first present among `name, bucket, identifier, function_name, domain_name, cluster_identifier`.
+The verify plan runs the **branch config** against the **base state** in the base data dir (`init -reconfigure` with the original key). Rule, per `resource_changes[]`:
 
-`import_ids.yaml`: `type → format` used to build the import id from state attributes (default `{id}`; e.g. `aws_iam_role_policy_attachment: "{role}/{policy_arn}"`, `aws_route53_record: "{zone_id}_{name}_{type}"`, `aws_lambda_permission: "{function_name}/{statement_id}"`, `aws_iam_role_policy: "{role}:{name}"`, `aws_scheduler_schedule: "{group_name}/{name}"`, `kubernetes_service_account_v1: "{metadata.0.namespace}/{metadata.0.name}"`, `helm_release: "{namespace}/{name}"`), plus `non_importable: [random_*, null_resource, terraform_data, time_*, tls_private_key, local_file, archive_file, aws_acm_certificate_validation, aws_lambda_invocation]` which force the `state` strategy for those addresses (mixed strategy allowed: imports for the importable, state injection for the rest).
+- every `create` claim address must have `importing` set, and `actions == ["no-op"]`, or `actions == ["update"]` with empty `replace_paths` and every differing attribute in `virtual_attributes[type]` (write-only attributes such as `aws_lambda_function.filename`/`source_code_hash`, `force_destroy`, `deletion_window_in_days`, `skip_final_snapshot`, `helm_release.values`) — otherwise it is a hard failure with the offenders listed;
+- addresses under an `update` claim may show `update` (that is the branch's change);
+- any other `update` → failure unless `--allow-import-updates` (then a warning);
+- any `delete`, replace, `forget` → failure;
+- `replace_prone` types (e.g. `aws_lambda_layer_version`) and `non_importable` types are refused up-front (§6 `merge`).
 
-Users extend/override with `.tofu-overlay.yaml` at repo root (`identity:`, `import_ids:`, `policy:`).
+`import { to = ADDRESS  id = "IMPORT_ID" }` blocks use `import_ids.yaml` formats (identity-based imports are a later option). Types absent from the file default to `{id}` with a warning and strict no-op verification.
 
-## 9. Safety rails
+## 9. Type knowledge
 
-- Never touches the base state except in `merge --strategy state` and `finalize`, both under a manual DynamoDB lock item (`LockID = bucket/key`, same format as OpenTofu's, so a concurrent `tofu` run sees the lock).
-- Every mutating command prints what it is about to do and asks for confirmation unless `--yes`/CI.
-- `apply` refuses stale overlays; `check` is idempotent and read-only.
-- Overlay state keys are namespaced with `@`, which cannot collide with the repo's existing keys, and are enumerable (`list` uses the registry, not S3 listing).
-- The tool never stores credentials; it uses the same AWS profile/OIDC as tofu.
+`data/identity.yaml`: `type → [attribute paths]` (e.g. `aws_route53_record: [zone_id, name, type, set_identifier]`, `kubernetes_namespace: [metadata.0.name]`). Fallback: first present among `name, bucket, identifier, function_name, domain_name, cluster_identifier, cluster_id, replication_group_id, key`. Values are normalised (Route53 names lower-cased without trailing dot).
 
-## 10. Bonus (design only): syncing overlays
+`data/import_ids.yaml`: `formats: type → "{attr}/…"`, `non_importable: […]`, `replace_prone: […]`, `virtual_attributes: type → [attrs]`. Users extend both with `.tofu-overlay.yaml` (`identity:`, `import_ids:`, `virtual_attributes:`, `policy:`).
 
-Overlay B may depend on something overlay A created. Injecting A's resources into B's *state* is wrong: B's config does not declare them, so B would plan their destruction. Two sound options:
+## 10. Configuration file `.tofu-overlay.yaml` (repo root, found by walking up)
 
-1. **Data sources**: B reads A's resources by identity (`data "aws_s3_bucket"`). Works today, needs A applied first.
-2. **Stacked overlays**: `create B --base-overlay A` copies A's state instead of the base and records `parent: A`. B's freshness tracks A's serial. When A merges, B rebases onto the base. This mirrors stacked PRs and keeps every state with exactly one source of truth. Rebase across a chain is the hard part (A merged → B's `create` claims re-injected on top of the new base, A's claims now in base).
+```yaml
+policy:
+  allowed_base_keys: ["acme/webshop/*/dev", "acme/*/sandbox"]
+  trunk_branch: main
+  env_dir_glob: "stacks/*/env/*"
+  tombstone_days: 14
+  apply_timeout_min: 90
+  max_overlay_age_days: 30
+binary: tofu
+identity: {}
+import_ids: {}
+virtual_attributes: {}
+```
 
-Proposal: implement (2) as `create --base-overlay` + `rebase` awareness, behind an `experimental` flag, after v1.
+## 11. Deferred (documented, not implemented)
 
-## 11. CI integration (Azure DevOps / any)
-
-- PR build validation: `tofu-overlay check` + `tofu-overlay plan` (exit 3/4 fail the build) on the branch's overlay.
-- Trunk pipeline (after merge): unchanged — the imports file rides with the code; the trunk plan shows N imports; after apply, a scheduled or manual `tofu-overlay finalize` cleans up.
-- The overlay's apply is run by the developer (or a manually triggered pipeline on the branch) with the environment's approval as usual.
+- `merge --strategy state` (direct injection into the base under the tofu lock protocol), with lineage, provider address and schema-version checks. See LIMITS.md.
+- `--destructive exclusive` (single-overlay replacement of base resources).
+- Stacked overlays (`create --base-overlay`), see SYNC-PROPOSAL.md.
+- `registry repair`, DynamoDB registry backend, identity-based `import` blocks, non-default workspaces, state encryption surgery.
 
 ## 12. Repository layout
 
 ```
-tofu-overlay/
-  pyproject.toml            # hatchling, package kmr-tofu-overlay, CLI tofu-overlay
-  src/tofu_overlay/
-    __init__.py  cli.py  config.py  backend.py  s3state.py  lock.py
-    registry.py  models.py  tofu.py  plan.py  identity.py  imports.py
-    overlay.py  merge.py  output.py
-    data/identity.yaml  data/import_ids.yaml
-  tests/            # pytest + moto (S3/DynamoDB), fixtures: plan JSON, state JSON, registry
-  docs/DESIGN.md  docs/LIMITS.md  docs/SYNC-PROPOSAL.md  docs/CI.md
-  .github/workflows/ci.yml   # ruff + pytest
-  README.md  LICENSE (MIT)  CHANGELOG.md
+src/tofu_overlay/
+  __init__.py     version
+  cli.py          typer app, exit-code mapping
+  config.py       .tofu-overlay.yaml, CI detection, overlay naming, git helpers
+  backend.py      backend resolution, key builders (overlay/registry/archive), workspace refusal
+  s3state.py      boto3 session, HEAD/list/copy/delete, registry JSON CAS, DynamoDB md5/lock items
+  registry.py     Registry document, update(fn), status machine, claims
+  tofu.py         runner: init/plan/show/apply/state pull|push|rm, arg validation, streaming
+  state.py        state document helpers: addresses, instances, inject/remove, lineage/serial, identity
+  identity.py     type knowledge loader (YAML + overrides), identity/import-id/virtual attrs
+  plan.py         plan JSON analysis and policy checks
+  overlay.py      create/plan/apply/status/check/rebase/abandon/finalize/gc/doctor
+  merge.py        imports file generation, verify, undo, guard
+  output.py       console/CI/JSON output, confirmations
+  models.py       pydantic models, enums, exit codes
+  data/identity.yaml  data/import_ids.yaml
+tests/            pytest + moto; fixtures/ (plan/state JSON)
+docs/DESIGN.md LIMITS.md CI.md SYNC-PROPOSAL.md
 ```
-
-Dependencies: `boto3`, `python-hcl2`, `pydantic`, `typer`, `rich`, `pyyaml`. Dev: `pytest`, `moto[s3,dynamodb]`, `ruff`.
