@@ -14,6 +14,7 @@ from tofu_overlay import plan
 from tofu_overlay.models import (
     ClaimKind,
     PlanSummary,
+    PolicyError,
     PolicyResult,
     RegistryDoc,
     ResourceChange,
@@ -1018,3 +1019,93 @@ class TestIgnoredAttributesAndTrunkDrift:
         assert result.drift == ["aws_s3_bucket.assets", "aws_s3_bucket.logs"]
         dumped = result.model_dump(mode="json")
         assert dumped["drift"] == result.drift and dumped["ignored"] == []
+
+
+# ------------------------------------------------------------- targeted apply gate
+
+
+def _reports_create() -> ResourceChange:
+    attrs = {"bucket": "s3-acme-dev-reports", "force_destroy": False}
+    return mk_change("aws_s3_bucket.reports", ["create"], after=attrs, after_unknown={"id": True})
+
+
+def _logs_update() -> ResourceChange:
+    before = {"id": "s3-acme-dev-logs", "bucket": "s3-acme-dev-logs", "tags": {}}
+    return _update("aws_s3_bucket.logs", before, {**before, "tags": {"env": "dev"}})
+
+
+class TestGateTargetedPlan:
+    """DESIGN §7.9: the targeted plan of `apply --only-claims` holds nothing but claims."""
+
+    def test_accepts_claims_ignored_updates_and_noops(self, evaluate, me) -> None:
+        lambda_after = {**LAMBDA_BEFORE, "filename": "elsewhere.zip"}
+        changes = [
+            _reports_create(),
+            _update("aws_lambda_function.worker", LAMBDA_BEFORE, lambda_after),
+            mk_change("aws_s3_bucket.assets", ["no-op"], before={}, after={}),
+            mk_change("data.aws_caller_identity.current", ["read"]),
+        ]
+        full = evaluate(changes)
+        targeted = evaluate(changes)
+        claims, warnings = plan.gate_targeted_plan(
+            changes, targeted, me=me, full_claims=full.claims
+        )
+        assert set(claims) == set(me.claims) | {"aws_s3_bucket.reports"}
+        assert set(claims) == set(full.claims)
+        assert warnings == []
+
+    def test_claim_absent_from_the_targeted_plan_is_dropped_with_a_warning(
+        self, evaluate, me
+    ) -> None:
+        create, logs = _reports_create(), _logs_update()
+        full = evaluate([create, logs])
+        assert {"aws_s3_bucket.reports", "aws_s3_bucket.logs"} <= set(full.claims)
+        targeted = evaluate([create])
+        claims, warnings = plan.gate_targeted_plan(
+            [create], targeted, me=me, full_claims=full.claims
+        )
+        assert "aws_s3_bucket.reports" in claims
+        assert "aws_s3_bucket.logs" not in claims
+        assert set(claims) <= set(full.claims)
+        assert warnings == [
+            "aws_s3_bucket.logs: claimed by the full plan but absent from the targeted plan; "
+            "claim dropped"
+        ]
+
+    def test_existing_claims_untouched_by_the_targeted_plan_are_kept(self, evaluate, me) -> None:
+        create = _reports_create()
+        full = evaluate([create])
+        targeted = evaluate([create])
+        claims, _warnings = plan.gate_targeted_plan(
+            [create], targeted, me=me, full_claims=full.claims
+        )
+        assert claims["aws_iam_role.app"].kind is ClaimKind.UPDATE
+        assert set(me.claims) <= set(claims)
+
+    def test_pulled_in_drift_is_refused(self, evaluate, me) -> None:
+        create, logs = _reports_create(), _logs_update()
+        drift = {"aws_s3_bucket.logs": ["update"]}
+        full = evaluate([create, logs], trunk_drift=drift)
+        assert full.drift == ["aws_s3_bucket.logs"]
+        targeted = evaluate([create, logs], trunk_drift=drift)
+        with pytest.raises(PolicyError, match="carry trunk drift.*aws_s3_bucket.logs") as exc:
+            plan.gate_targeted_plan([create, logs], targeted, me=me, full_claims=full.claims)
+        assert "--accept-drift" in str(exc.value)
+
+    def test_pulled_in_address_outside_the_claims_is_refused(self, evaluate, me) -> None:
+        create, logs = _reports_create(), _logs_update()
+        full = evaluate([create])
+        targeted = evaluate([create, logs])
+        assert "aws_s3_bucket.logs" in targeted.claims  # no baseline: it would be claimed
+        with pytest.raises(PolicyError, match="outside the overlay's claims.*aws_s3_bucket.logs"):
+            plan.gate_targeted_plan([create, logs], targeted, me=me, full_claims=full.claims)
+
+    def test_violations_are_refused_first(self, evaluate, me) -> None:
+        create = _reports_create()
+        attrs = {"id": "s3-acme-dev-logs", "bucket": "s3-acme-dev-logs"}
+        delete = mk_change("aws_s3_bucket.logs", ["delete"], before=attrs)
+        full = evaluate([create])
+        targeted = evaluate([create, delete])
+        assert not targeted.ok
+        with pytest.raises(PolicyError, match="policy violation"):
+            plan.gate_targeted_plan([create, delete], targeted, me=me, full_claims=full.claims)

@@ -19,6 +19,7 @@ from tofu_overlay.models import (
     ClaimKind,
     Overlay,
     PlanSummary,
+    PolicyError,
     PolicyResult,
     RegistryDoc,
     ResourceChange,
@@ -435,6 +436,59 @@ def evaluate(
         drift=sorted(ev.drift),
         ignored=sorted(ev.ignored),
     )
+
+
+# ------------------------------------------------------------ targeted apply
+
+
+def gate_targeted_plan(
+    changes: list[ResourceChange],
+    targeted: PolicyResult,
+    *,
+    me: Overlay,
+    full_claims: dict[str, Claim],
+) -> tuple[dict[str, Claim], list[str]]:
+    """DESIGN §7.9: accept the tool-targeted plan of ``apply --only-claims``.
+
+    ``targeted`` is the evaluation (same inputs as the full plan) of a plan
+    targeted at ``full_claims``, the claims of the full plan. Every non-no-op
+    managed change must be a claim of this overlay (an existing claim of
+    ``me`` or one of ``full_claims``) or an ignored-attributes update: trunk
+    drift and any other address that tofu pulled in through dependencies
+    refuse the apply with ``PolicyError``, as do the usual violations
+    (delete/replace of base addresses stay denied).
+
+    Returns the claims to acquire (the targeted evaluation's own, which are by
+    construction a subset of ``full_claims`` plus the untouched claims of
+    ``me``) and one warning per full-plan claim the targeted plan left out
+    (dropped, not acquired).
+    """
+    if not targeted.ok:
+        raise PolicyError(
+            f"{len(targeted.violations)} policy violation(s) in the targeted plan, apply refused"
+        )
+    if targeted.drift:
+        raise PolicyError(
+            f"{len(targeted.drift)} dependency(ies) of your changes carry trunk drift "
+            f"({', '.join(targeted.drift)}); apply the trunk first or use --accept-drift"
+        )
+    planned = {
+        c.address
+        for c in changes
+        if not _is_data(c) and tuple(c.actions) not in (_NOOP, _READ)
+    }
+    allowed = set(full_claims) | set(me.claims) | set(targeted.ignored)
+    unknown = sorted(planned - allowed)
+    if unknown:
+        raise PolicyError(
+            f"{len(unknown)} address(es) outside the overlay's claims pulled into the targeted "
+            f"plan ({', '.join(unknown)}); apply the trunk first or use --accept-drift"
+        )
+    warnings = [
+        f"{address}: claimed by the full plan but absent from the targeted plan; claim dropped"
+        for address in sorted(set(full_claims) - set(me.claims) - planned)
+    ]
+    return dict(targeted.claims), warnings
 
 
 # --------------------------------------------------------------- merge verify

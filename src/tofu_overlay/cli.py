@@ -348,6 +348,14 @@ def apply(
             help="Claim base updates that are trunk drift (needs --yes in CI).",
         ),
     ] = False,
+    only_claims: Annotated[
+        bool,
+        typer.Option(
+            "--only-claims",
+            help="When the plan carries trunk drift or ignored updates, apply only the "
+            "overlay's claims through a tool-targeted, gated plan.",
+        ),
+    ] = False,
     tofu_args: Annotated[list[str] | None, typer.Argument(metavar="[-- TOFU_ARGS...]")] = None,
 ) -> None:
     """Acquire claims and apply the plan on the overlay state."""
@@ -358,6 +366,8 @@ def apply(
             raise PolicyError("--auto-approve requires --yes outside CI")
         if accept_drift and config.is_ci() and not setup.g.yes:
             raise PolicyError("--accept-drift requires --yes in CI")
+        if only_claims and accept_drift:
+            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
         svc = setup.service()
         ov = svc.apply(
             auto_approve=auto_approve,
@@ -366,12 +376,16 @@ def apply(
             extra=list(tofu_args or []),
             yes=setup.g.yes,
             accept_drift=accept_drift,
+            only_claims=only_claims,
         )
+        targets = svc.apply_targets
         _emit(
             setup,
             {
                 "overlay": ov.model_dump(mode="json"),
                 "remote_overlays": svc.remote_overlay_keys(svc.name),
+                "only_claims": targets is not None,
+                "targets": list(targets or []),
             },
             lambda: None,
         )

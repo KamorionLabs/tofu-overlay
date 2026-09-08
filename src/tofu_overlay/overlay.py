@@ -40,6 +40,7 @@ from tofu_overlay.models import (
     RegistryDoc,
     RegistryError,
     RemoteStateRef,
+    ResourceChange,
     StaleError,
     Status,
     ToolConfig,
@@ -164,6 +165,7 @@ class OverlayService:
         self._remote_warnings: list[str] = []
         # Injectable subprocess entry point for the few git calls config.py does not cover.
         self.git_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+        self.apply_targets: list[str] | None = None
 
     # ------------------------------------------------------------------ properties
 
@@ -1001,6 +1003,17 @@ class OverlayService:
         _prune_plan_files(self.data_dir)
         planfile = self.data_dir / f"tfplan.{new_run_id()}"
         runner.plan(planfile, extra=extra)
+        _changes, summary, evaluate = self._evaluate_planfile(runner, planfile, ov, doc)
+        policy = self._classify_drift(ov, evaluate, accept_drift=accept_drift)
+        self._report_policy(policy, summary)
+        return policy, summary, planfile, stale
+
+    def _evaluate_planfile(
+        self, runner: TofuRunner, planfile: Path, ov: Overlay, doc: RegistryDoc
+    ) -> tuple[
+        list[ResourceChange], PlanSummary, Callable[[dict[str, list[str]] | None], PolicyResult]
+    ]:
+        """Parse a saved plan and bind the policy evaluation to it (trunk baseline left open)."""
         changes, drift, summary = planmod.parse_plan(runner.show_json(planfile))
 
         def evaluate(trunk_drift: dict[str, list[str]] | None) -> PolicyResult:
@@ -1016,9 +1029,7 @@ class OverlayService:
                 trunk_drift=trunk_drift,
             )
 
-        policy = self._classify_drift(ov, evaluate, accept_drift=accept_drift)
-        self._report_policy(policy, summary)
-        return policy, summary, planfile, stale
+        return changes, summary, evaluate
 
     def _classify_drift(
         self,
@@ -1098,30 +1109,93 @@ class OverlayService:
         extra: list[str] | None = None,
         yes: bool = False,
         accept_drift: bool = False,
+        only_claims: bool = False,
     ) -> Overlay:
         """Plan, confirm, acquire claims atomically, apply, then record ids from the state.
 
         A saved plan never prompts in tofu, so the confirmation is the tool's
         own: skipped with ``--auto-approve`` or ``--yes``, refused in CI without
         them. Trunk drift on base updates refuses the apply (exit 4) unless
-        ``accept_drift``, which claims those updates (DESIGN §7.8).
+        ``accept_drift``, which claims those updates (DESIGN §7.8), or
+        ``only_claims``, which re-plans targeted at the claims and applies that
+        gated plan, leaving drift and ignored updates out (DESIGN §7.9).
+        ``apply_targets`` holds the target set of the last call (``None`` when
+        the full plan was applied).
         """
         if config.is_ci() and (allow_stale or allow_behind):
             raise PolicyError("--allow-stale/--allow-behind are refused in CI")
         if config.is_ci() and accept_drift and not yes:
             raise PolicyError("--accept-drift requires --yes in CI")
-        _doc, ov = self._load()
+        if only_claims and accept_drift:
+            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
+        self.apply_targets = None
+        doc, ov = self._load()
         self._gate(ov, {Status.ACTIVE, Status.DIRTY}, "apply")
         policy, summary, planfile, stale = self.plan(
             extra=extra, allow_behind=allow_behind, accept_drift=accept_drift
         )
         try:
+            if stale and not allow_stale:
+                raise StaleError("overlay is stale; run `rebase` (or --allow-stale outside CI)")
+            if not policy.ok:
+                raise PolicyError(f"{len(policy.violations)} policy violation(s), apply refused")
+            if only_claims and (policy.drift or policy.ignored):
+                policy, summary, planfile = self._plan_only_claims(doc, ov, policy, planfile, extra)
+            elif policy.drift:
+                raise DriftError(
+                    f"{len(policy.drift)} base resource(s) differ because the trunk is not "
+                    f"applied on this base ({', '.join(policy.drift)}); run the trunk pipeline, "
+                    "then `rebase`, pass --accept-drift to claim them or --only-claims to "
+                    "leave them out"
+                )
             return self._apply_planned(
-                ov, policy, summary, planfile, stale,
+                ov, policy, summary, planfile,
                 allow_stale=allow_stale, confirmed=auto_approve or yes,
             )
         finally:
             planfile.unlink(missing_ok=True)
+
+    def _plan_only_claims(
+        self,
+        doc: RegistryDoc,
+        ov: Overlay,
+        full: PolicyResult,
+        planfile: Path,
+        extra: list[str] | None,
+    ) -> tuple[PolicyResult, PlanSummary, Path]:
+        """``apply --only-claims``: re-plan targeted at the claims and gate it (DESIGN §7.9).
+
+        The target set is exactly the claim set of the full plan (the tool's own
+        targeting, never user pass-through); the targeted plan is evaluated with
+        the same inputs and accepted only when it holds nothing but those claims
+        and ignored-attributes updates. The full plan file is deleted here.
+        """
+        planfile.unlink(missing_ok=True)
+        targets = sorted(full.claims)
+        self.apply_targets = targets
+        left_out = sorted(set(full.drift) | set(full.ignored))
+        self.console.info(
+            f"targeted apply: {len(targets)} address(es); left out: {', '.join(left_out)}"
+        )
+        if not targets:
+            return PolicyResult(), PlanSummary(), planfile
+        trunk_drift = self.trunk_baseline() if full.drift else None
+        runner = self._overlay_runner()
+        targeted_file = self.data_dir / f"tfplan.{new_run_id()}"
+        runner.plan(targeted_file, extra=list(extra or []), targets=targets)
+        changes, summary, evaluate = self._evaluate_planfile(runner, targeted_file, ov, doc)
+        policy = evaluate(trunk_drift)
+        self._report_policy(policy, summary)
+        try:
+            claims, warnings = planmod.gate_targeted_plan(
+                changes, policy, me=ov, full_claims=full.claims
+            )
+        except PolicyError:
+            targeted_file.unlink(missing_ok=True)
+            raise
+        for warning in warnings:
+            self.console.warn(warning)
+        return policy.model_copy(update={"claims": claims}), summary, targeted_file
 
     def _apply_planned(
         self,
@@ -1129,21 +1203,10 @@ class OverlayService:
         policy: PolicyResult,
         summary: PlanSummary,
         planfile: Path,
-        stale: bool,
         *,
         allow_stale: bool,
         confirmed: bool,
     ) -> Overlay:
-        if stale and not allow_stale:
-            raise StaleError("overlay is stale; run `rebase` (or --allow-stale outside CI)")
-        if policy.drift:
-            raise DriftError(
-                f"{len(policy.drift)} base resource(s) differ because the trunk is not applied "
-                f"on this base ({', '.join(policy.drift)}); run the trunk pipeline, then "
-                "`rebase`, or pass --accept-drift to claim them"
-            )
-        if not policy.ok:
-            raise PolicyError(f"{len(policy.violations)} policy violation(s), apply refused")
         if not _has_changes(summary):
             self.console.info("no changes, nothing to apply")
             return ov
@@ -1167,7 +1230,10 @@ class OverlayService:
         except Exception as exc:  # noqa: BLE001 - recorded then re-raised
             error = exc
         finally:
-            doc = self._finish_apply(ok, claims, summary, run_id=run_id, released=released)
+            doc = self._finish_apply(
+                ok, claims, summary, run_id=run_id, released=released,
+                targets=self.apply_targets,
+            )
         if error is not None:
             raise error
         final = doc.overlays[self.name]
@@ -1182,6 +1248,7 @@ class OverlayService:
         *,
         run_id: str | None = None,
         released: set[str] | None = None,
+        targets: list[str] | None = None,
     ) -> RegistryDoc:
         filled = claims
         to_release = set(released or ())
@@ -1205,6 +1272,7 @@ class OverlayService:
             summary=summary.model_dump(by_alias=True),
             run_id=run_id,
             released=to_release,
+            targets=targets,
         )
 
     # ------------------------------------------------------------------ status / list

@@ -282,3 +282,36 @@ rejects. This is harmless by construction (the attribute is write-only or
 informational), but it means the overlay state carries the overlay's local
 path for that resource; the trunk state keeps its own. If a real attribute
 changes alongside an ignored one, the update is claimed as usual.
+
+`apply --only-claims` (15) is the way to keep such updates out of the
+overlay state altogether.
+
+## 15. A targeted apply leaves the trunk's pending changes unapplied
+
+On stacks whose plans carry machine-dependent noise (a module that zips
+Lambda code locally, a CloudFormation stack parameterised with `path.cwd`),
+every overlay plan shows the branch's creates plus base updates that the
+trunk baseline shows too (13) or that only touch ignored attributes (14).
+`apply --only-claims` answers that case: it re-plans with `-target` on
+exactly the claim set and applies that plan, after gating it again
+(DESIGN §7.9). Drift and ignored updates are then *not* applied on the
+overlay, which is the point: the overlay state keeps the base's values for
+them, and the next `plan` reports the same `drift:`/`ignored:` lines (and
+`check` the same warning) until the trunk pipeline applies them and the
+overlay is rebased.
+
+Caveats:
+
+- `-target` is tofu's partial-graph mode: a targeted plan can pull in
+  dependencies of the claims. The gate refuses any pulled-in address that is
+  not a claim or an ignored update, drift included, with exit 3; the way out
+  is the trunk pipeline (then `rebase`), or `--accept-drift`;
+- a claim of the full plan that the targeted plan does not show (a resource
+  whose creation depends on an unapplied change) is dropped, not acquired;
+  it is claimed by the next apply;
+- the overlay state after a targeted apply is a partial application of the
+  branch config. `merge` verification (DESIGN §8) and `check` reason on
+  claims and do not care, but do not expect the overlay to reflect the whole
+  branch;
+- `--only-claims` and `--accept-drift` are mutually exclusive; without drift
+  or ignored updates the flag changes nothing (one plan, applied whole).

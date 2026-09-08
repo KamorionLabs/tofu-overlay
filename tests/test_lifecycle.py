@@ -53,10 +53,13 @@ class FakeRunner:
     plans from ``desired_trunk`` (the trunk config); ``desired_by_cwd`` maps an
     exact or ancestor directory to its own desired config and wins over both.
     A desired entry whose ``attrs`` differ from the state plans as an ``update``
-    (``after_unknown`` optional).
+    (``after_unknown`` optional). ``plan(targets=[...])`` keeps only those
+    addresses plus ``pulled_in`` (the dependencies tofu would drag into a
+    targeted plan).
     """
 
     session: Any = None
+    pulled_in: set[str] = set()
     desired: dict[str, dict[str, Any]] = {}
     desired_trunk: dict[str, dict[str, Any]] = {}
     desired_by_cwd: dict[Path, dict[str, dict[str, Any]]] = {}
@@ -181,7 +184,12 @@ class FakeRunner:
         )
 
     def plan(self, out: Path, *, extra=None, destroy=False, targets=None, refresh=True) -> int:
-        FakeRunner.calls.append(["plan", self.key, "destroy" if destroy else "", *(extra or [])])
+        FakeRunner.calls.append(
+            [
+                "plan", self.key, "destroy" if destroy else "", *(extra or []),
+                *(f"-target={t}" for t in targets or []),
+            ]
+        )
         FakeRunner.plan_cwds.append(self.cwd)
         present = statemod.index_instances(self.state_pull())
         imports = self._imports()
@@ -213,6 +221,9 @@ class FakeRunner:
             for address, (entry, inst) in present.items():
                 if entry.get("mode") == "managed" and address not in desired:
                     changes.append(self._entry(address, entry, inst, ["delete"]))
+        if targets is not None:
+            keep = set(targets) | FakeRunner.pulled_in
+            changes = [c for c in changes if c["address"] in keep]
         out.write_text(
             json.dumps({"format_version": "1.2", "resource_changes": changes, "resource_drift": []})
         )
@@ -296,11 +307,13 @@ def fake_runner(boto_session, base_in_s3: dict):
     }
     FakeRunner.desired = desired
     FakeRunner.desired_by_cwd = {}
+    FakeRunner.pulled_in = set()
     yield FakeRunner
     FakeRunner.session = None
     FakeRunner.desired = {}
     FakeRunner.desired_trunk = {}
     FakeRunner.desired_by_cwd = {}
+    FakeRunner.pulled_in = set()
 
 
 @pytest.fixture
@@ -915,6 +928,106 @@ class TestTrunkDriftLifecycle:
         assert _trunk_plans(service) == []
 
 
+def _overlay_plans(service) -> list[list[str]]:
+    return [c for c in FakeRunner.calls if c[0] == "plan" and c[1] == service.overlay_key]
+
+
+class TestOnlyClaimsLifecycle:
+    """`apply --only-claims` (DESIGN §7.9): a tool-targeted, gated plan of the claim set."""
+
+    def test_drift_left_out_and_only_the_create_applied(self, service, s3_client, console):
+        service.create()
+        _trunk_moves_role()
+        role_before = _overlay_attrs(s3_client, service, ROLE_ADDRESS)
+        FakeRunner.calls.clear()
+        ov = service.apply(
+            auto_approve=True, allow_stale=False, allow_behind=False, only_claims=True
+        )
+        assert ov.status == Status.ACTIVE
+        assert set(ov.claims) == {NEW_ADDRESS}
+        assert ov.claims[NEW_ADDRESS].id == NEW_BUCKET
+        assert ov.last_apply["ok"] and ov.last_apply["only_claims"] is True
+        assert ov.last_apply["targets"] == [NEW_ADDRESS]
+        assert ov.last_apply["summary"]["create"] == 1
+        assert ov.last_apply["summary"]["update"] == 0
+        assert service.apply_targets == [NEW_ADDRESS]
+        plans = _overlay_plans(service)
+        assert len(plans) == 2
+        assert plans[0][3:] == [] and plans[1][3:] == [f"-target={NEW_ADDRESS}"]
+        assert [c for c in FakeRunner.calls if c[0] == "apply"] == [["apply", service.overlay_key]]
+        assert _overlay_attrs(s3_client, service, ROLE_ADDRESS) == role_before
+        assert _overlay_attrs(s3_client, service, NEW_ADDRESS)["bucket"] == NEW_BUCKET
+        assert not list(service.data_dir.glob("tfplan.*"))
+        err = console.stderr.getvalue()
+        assert f"targeted apply: 1 address(es); left out: {ROLE_ADDRESS}" in err
+        # The trunk's pending change was not applied: the next plan reports it again.
+        policy, _summary, _planfile, _stale = service.plan()
+        assert policy.drift == [ROLE_ADDRESS]
+        assert set(policy.claims) == {NEW_ADDRESS}
+
+    def test_pulled_in_dependency_with_drift_refuses_and_applies_nothing(
+        self, service, s3_client
+    ):
+        service.create()
+        _trunk_moves_role()
+        FakeRunner.pulled_in = {ROLE_ADDRESS}
+        FakeRunner.calls.clear()
+        with pytest.raises(PolicyError, match="carry trunk drift") as exc:
+            service.apply(
+                auto_approve=True, allow_stale=False, allow_behind=False, only_claims=True
+            )
+        assert exc.value.exit_code == ExitCode.POLICY
+        assert ROLE_ADDRESS in str(exc.value) and "--accept-drift" in str(exc.value)
+        assert len(_overlay_plans(service)) == 2
+        assert not [c for c in FakeRunner.calls if c[0] == "apply"]
+        assert _status_of(service) == Status.ACTIVE
+        doc, _ = service.registry.load()
+        assert doc.overlays[service.name].claims == {}
+        with pytest.raises(KeyError):
+            _overlay_attrs(s3_client, service, NEW_ADDRESS)
+        assert not list(service.data_dir.glob("tfplan.*"))
+
+    def test_only_claims_with_accept_drift_is_refused_before_planning(self, service):
+        service.create()
+        FakeRunner.calls.clear()
+        with pytest.raises(PolicyError, match="mutually exclusive"):
+            service.apply(
+                auto_approve=True, allow_stale=False, allow_behind=False,
+                accept_drift=True, only_claims=True,
+            )
+        assert _overlay_plans(service) == []
+
+    def test_without_drift_or_ignored_it_is_a_normal_apply(self, service):
+        service.create()
+        FakeRunner.calls.clear()
+        ov = service.apply(
+            auto_approve=True, allow_stale=False, allow_behind=False, only_claims=True
+        )
+        plans = _overlay_plans(service)
+        assert len(plans) == 1 and plans[0][3:] == []
+        assert service.apply_targets is None
+        assert ov.last_apply["only_claims"] is False
+        assert "targets" not in ov.last_apply
+        assert NEW_ADDRESS in ov.claims
+
+    def test_ignored_update_is_left_out(self, service, s3_client):
+        service.create()
+        FakeRunner.desired[LAMBDA_ADDRESS]["attrs"] = {
+            "filename": ".tofu-overlay/feature/.terraform/modules/worker/code.zip",
+        }
+        FakeRunner.desired[LAMBDA_ADDRESS]["after_unknown"] = {"last_modified": True}
+        lambda_before = _overlay_attrs(s3_client, service, LAMBDA_ADDRESS)
+        FakeRunner.plan_cwds.clear()
+        ov = service.apply(
+            auto_approve=True, allow_stale=False, allow_behind=False, only_claims=True
+        )
+        assert ov.last_apply["targets"] == [NEW_ADDRESS]
+        assert ov.last_apply["summary"]["update"] == 0
+        assert set(ov.claims) == {NEW_ADDRESS}
+        assert _overlay_attrs(s3_client, service, LAMBDA_ADDRESS) == lambda_before
+        assert _trunk_plans(service) == []
+
+
 class TestIgnoredAttributesLifecycle:
     def test_lambda_filename_change_is_applied_without_claim(self, service, s3_client, console):
         service.create()
@@ -1271,6 +1384,31 @@ class TestCli:
         assert result.exit_code == 0, result.output
         warnings = json.loads(result.stdout)["results"][0]["warnings"]
         assert any(w.startswith("trunk drift:") for w in warnings)
+
+    def test_only_claims_flag_and_json_output(self, cli_env):
+        assert _invoke(cli_env, "create").exit_code == 0
+        _trunk_moves_role()
+        result = _invoke(
+            cli_env, "--yes", "apply", "--auto-approve", "--only-claims", "--accept-drift"
+        )
+        assert result.exit_code == int(ExitCode.POLICY), result.output
+        assert "mutually exclusive" in result.output
+
+        result = _invoke(cli_env, "--yes", "apply", "--auto-approve", "--only-claims")
+        assert result.exit_code == 0, result.output
+        assert "targeted apply: 1 address(es)" in result.output
+        assert "apply done" in result.output
+
+        result = _invoke(cli_env, "--json", "--yes", "apply", "--auto-approve", "--only-claims")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["only_claims"] is True and payload["targets"] == [NEW_ADDRESS]
+        assert list(payload["overlay"]["claims"]) == [NEW_ADDRESS]
+        assert payload["overlay"]["last_apply"]["only_claims"] is True
+
+        result = _invoke(cli_env, "--json", "plan")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["drift"] == [ROLE_ADDRESS]
 
     def test_chdir_with_relative_backend_config(self, cli_env, monkeypatch):
         repo = cli_env.parents[3]

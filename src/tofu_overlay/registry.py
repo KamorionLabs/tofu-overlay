@@ -355,16 +355,19 @@ class Registry:
         summary: dict,
         run_id: str | None = None,
         released: Iterable[str] = (),
+        targets: Iterable[str] | None = None,
     ) -> RegistryDoc:
         """Record the outcome of an apply: ACTIVE on success, DIRTY (claims kept) on failure.
 
         ``run_id`` must still be the overlay's current run: a superseded (stale)
         apply is refused so it cannot flip the status under a newer run.
         ``released`` addresses (own resources the plan deleted) are dropped from
-        the claims on success only.
+        the claims on success only. ``targets`` (``apply --only-claims``) marks
+        ``last_apply`` as targeted and records the target set.
         """
         now = utcnow_iso()
         to_release = set(released)
+        target_list = sorted(targets) if targets is not None else None
 
         def mutate(doc: RegistryDoc) -> None:
             ov = self.get_overlay(doc, name)
@@ -397,7 +400,10 @@ class Registry:
                 "summary": dict(summary),
                 "base_etag_after": base_etag_after,
                 "base_moved": bool(base_etag_after and base_etag_after != ov.base_etag),
+                "only_claims": target_list is not None,
             }
+            if target_list is not None:
+                ov.last_apply["targets"] = target_list
             ov.updated_at = now
 
         return self.update(mutate)

@@ -8,6 +8,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `apply --only-claims` (DESIGN §7.9): when the plan carries trunk drift or
+  ignored-attributes updates, a second plan targeted at exactly the claim set
+  (`TofuRunner.plan(targets=...)`, the tool's own `-target`; pass-through
+  `-target` stays refused) is evaluated with the same inputs and gated by
+  `plan.gate_targeted_plan` (only claims and ignored updates may appear;
+  pulled-in drift or any other address refuses with exit 3), then applied;
+  claims acquired are those of the targeted plan (full-plan claims it left
+  out are dropped with a warning). `last_apply.only_claims`/`targets` are
+  recorded (`Registry.finish_apply(targets=...)`), `apply --json` carries
+  `only_claims` and `targets`, the human output prints
+  `targeted apply: N address(es)`. Mutually exclusive with `--accept-drift`;
+  a no-op without drift or ignored updates. Documented in LIMITS.md §15.
 - Trunk drift detection (DESIGN §7.8): `OverlayService.trunk_baseline`
   plans the trunk config (`origin/<trunk>` checked out detached in a
   `git clone --shared` of the repository under `.tofu-overlay/_trunk/<sha>/`

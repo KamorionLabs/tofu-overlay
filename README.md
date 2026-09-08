@@ -117,7 +117,7 @@ lock table). Read-only commands never write anything, registry included.
 |---|---|---|
 | `create [--name N] [--force-name]` | overlay key, registry | Fork the base state into `<key>@<name>`, register the overlay. Refuses a tombstoned name, an existing `<key>@<name>` object outside the registry, a missing base. Re-running resumes a `creating` entry. |
 | `plan [--json] [--detailed-exitcode] [-- tofu args]` | none | Validate the overlay, freshness and git ancestry, `tofu plan` against the overlay state, `show -json`, policy checks. Base updates that a trunk plan would also produce (the trunk is not applied on this base) are listed as `drift`, not claimed; updates touching only environment-dependent attributes are `ignored`. In status `merging`: verify mode. |
-| `apply [--auto-approve] [--allow-stale] [--accept-drift]` | overlay key, registry | `plan`, then acquire claims atomically (registry CAS), `tofu apply`, refresh claim ids from the overlay state. Refuses stale overlays and trunk drift (exit 4; `--accept-drift` claims the drifted updates, with `--yes` in CI). |
+| `apply [--auto-approve] [--allow-stale] [--accept-drift \| --only-claims]` | overlay key, registry | `plan`, then acquire claims atomically (registry CAS), `tofu apply`, refresh claim ids from the overlay state. Refuses stale overlays and trunk drift (exit 4; `--accept-drift` claims the drifted updates, with `--yes` in CI; `--only-claims` applies a second plan targeted at the claims only, gated again, leaving drift and ignored updates out). |
 | `status [--json] [--repo]` | none | Overlays of this base (or of every base under `env_dir_glob`): owners, branch, freshness, status, claims, age, pending reverts. |
 | `list [--json]` | none | Same data as `status`, one line per overlay. `--bucket B --prefix P` scans registries without a checkout. |
 | `check [--json] [--repo]` | none | CI gate: overlay exists for the branch (else "no overlay", exit 0), fresh, branch contains trunk, claims match the overlay state, no conflicting overlay, imports file matches the claims; warns about trunk drift. |
@@ -138,7 +138,7 @@ lock table). Read-only commands never write anything, registry included.
 | 1 | Tool or tofu error. |
 | 2 | `plan --detailed-exitcode` only: changes present. |
 | 3 | Policy violation (denied action, conflicting claim, identity already in the base). |
-| 4 | Overlay stale (base moved), branch behind trunk, or trunk drift on base updates (`apply` without `--accept-drift`). |
+| 4 | Overlay stale (base moved), branch behind trunk, or trunk drift on base updates (`apply` without `--accept-drift` or `--only-claims`). |
 | 5 | Registry conflict, unreachable or invalid. |
 | 6 | Base key not allowed by `policy.allowed_base_keys`, or overlay not found. |
 | 7 | Overlay frozen (status `merging`). |
@@ -200,7 +200,12 @@ sections 13 and 14):
   trunk baseline (a shared clone of `origin/<trunk>` planned against the
   base state, cached under `.tofu-overlay/`) and lists those updates as `drift`
   without claiming them; `apply` refuses (exit 4) until the trunk pipeline
-  runs and the overlay is rebased, or `--accept-drift` claims them;
+  runs and the overlay is rebased, or `--accept-drift` claims them, or
+  `--only-claims` applies only the claims through a second plan targeted at
+  exactly the claim set and gated again (drift and ignored updates stay
+  unapplied and are reported again on the next plan; a dependency pulled in
+  with drift refuses with exit 3). `--json` on `apply` then carries
+  `only_claims` and `targets`; see [docs/LIMITS.md](docs/LIMITS.md) §15;
 - **environment-dependent attributes** (`aws_lambda_function.filename`
   under another `TF_DATA_DIR`, `last_modified`...): listed as `ignored`,
   not claimed, still applied by tofu. Extend the list with
