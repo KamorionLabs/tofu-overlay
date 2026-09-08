@@ -19,6 +19,8 @@ git push origin main v0.1.0
 
 The `build` job fails if the tag does not match `pyproject.toml`.
 
+After the release, run the `install-test` workflow (`gh workflow run install-test.yml -f version=<ver>`): it installs the published binary on `ubuntu-22.04` through `scripts/install.sh`. While the repository is private the script needs `GITHUB_TOKEN` and fetches assets through the API; on a public repository plain release URLs are used.
+
 ## Enable PyPI (one-time, maintainers)
 
 1. On PyPI, add a *pending* trusted publisher for project `kmr-tofu-overlay`: owner `KamorionLabs`, repository `tofu-overlay`, workflow `release.yml`, environment `pypi`.
