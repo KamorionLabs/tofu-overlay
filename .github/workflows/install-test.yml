@@ -1,0 +1,27 @@
+name: install-test
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to install (without v)"
+        default: "0.1.0"
+  release:
+    types: [published]
+
+jobs:
+  binary:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install from release with scripts/install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          V="${VERSION#v}"
+          curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/v${V}/scripts/install.sh" \
+            | TOFU_OVERLAY_BIN_DIR="$HOME/.local/bin" sh -s -- "$V"
+          "$HOME/.local/bin/tofu-overlay" version
+          "$HOME/.local/bin/tofu-overlay" --help > /dev/null
+          python3 --version
