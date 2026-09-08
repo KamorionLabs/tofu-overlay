@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +92,24 @@ class FakeRunner:
         return json.loads(body)
 
     def state_push(self, doc: dict, *, force: bool = False) -> None:
+        """Mimic `tofu state push`: without -force an empty remote gets a fresh lineage
+        and serial 1, a different lineage is refused, and the serial follows the remote."""
         FakeRunner.calls.append(["state push", self.key])
+        doc = dict(doc)
+        if not force:
+            try:
+                remote = self.state_pull()
+            except Exception:  # noqa: BLE001 - missing object == empty remote
+                remote = None
+            if not remote or not remote.get("lineage"):
+                doc["lineage"] = str(uuid.uuid4())
+                doc["serial"] = 1
+            else:
+                if remote.get("lineage") != doc.get("lineage"):
+                    raise ToolError("lineage mismatch: use -force")
+                if int(doc.get("serial") or 0) < int(remote.get("serial") or 0):
+                    raise ToolError("serial too low: use -force")
+                doc["serial"] = int(remote.get("serial") or 0) + 1
         self._s3().put_object(Bucket=BUCKET, Key=self.key, Body=json.dumps(doc).encode())
 
     def state_rm(self, addresses: list[str]) -> None:
@@ -1070,3 +1088,32 @@ class TestClaimsFromState:
         claim = filled["aws_ssm_parameter.secret"]
         assert claim.id == "/acme/secret"
         assert "hunter2" not in json.dumps(claim.model_dump())
+
+
+class TestLineageRegression:
+    """Regression for the first real run: `tofu state push` without -force into an empty
+    key generates its own lineage; the registry must record the stored one."""
+
+    def test_create_records_the_stored_lineage(self, service, s3_client):
+        ov = service.create()
+        stored = json.loads(
+            s3_client.get_object(Bucket=BUCKET, Key=service.overlay_key)["Body"].read()
+        )
+        assert stored["lineage"] == ov.lineage
+        assert any(call[0] == "state push" for call in FakeRunner.calls)
+        # A fresh service validates the overlay (lineage check) before planning.
+        policy, _summary, _planfile, _stale = service.plan()
+        assert policy.ok
+
+    def test_doctor_reports_lineage_mismatch(self, service):
+        service.create()
+        name = service.name
+
+        def tamper(d):
+            d.overlays[name] = d.overlays[name].model_copy(update={"lineage": "bogus"})
+
+        service.registry.update(tamper)
+        codes = {f["code"] for f in service.doctor()}
+        assert "lineage-mismatch" in codes
+        with pytest.raises(RegistryError):
+            service.plan()

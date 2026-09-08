@@ -824,7 +824,12 @@ class OverlayService:
         )
 
     def _push_forked(self, ov: Overlay, forked: dict) -> str:
-        """Push the forked document to the overlay key; skip when a resume already did."""
+        """Push the forked document with ``-force`` and return the lineage actually stored.
+
+        Without ``-force`` a push into an empty key makes tofu generate its own lineage
+        (and serial 1) instead of keeping the document's; the registry must record the
+        lineage that really sits behind the key, so it is read back after the push.
+        """
         runner = self._overlay_runner()
         if self.store.exists(self.overlay_key):
             current = runner.state_pull()
@@ -832,10 +837,16 @@ class OverlayService:
                 self.console.info("overlay state already pushed, skipping")
                 return ov.lineage
             self.console.warn("overlay object left by an interrupted create, overwriting")
-            runner.state_push(forked, force=True)
-        else:
-            runner.state_push(forked)
-        return forked["lineage"]
+        runner.state_push(forked, force=True)
+        pushed = runner.state_pull()
+        lineage = pushed.get("lineage")
+        if not lineage:
+            raise ToolError("pushed overlay state has no lineage")
+        if lineage != forked["lineage"]:
+            self.console.warn(
+                f"tofu stored lineage {lineage} instead of {forked['lineage']}; recording it"
+            )
+        return lineage
 
     def _safe_version(self) -> str | None:
         try:
@@ -1402,6 +1413,8 @@ class OverlayService:
                 if self.backend.dynamodb_table and self.store.digest_item_exists(ov.state_key):
                     findings.append({"level": "warning", "code": "orphan-md5",
                                      "message": f"digest item without object for {ov.state_key}"})
+            if ov.is_live() and ov.lineage and self.store.exists(ov.state_key):
+                self._doctor_lineage(name, ov, findings)
             if ov.status == Status.APPLYING and self.registry.stale_applying(
                 ov, self.cfg.policy.apply_timeout_min
             ):
@@ -1424,6 +1437,25 @@ class OverlayService:
                                  "message": f"{name} ({tomb.status}) modified base resources "
                                             "the trunk still has to revert: "
                                             + ", ".join(tomb.pending_revert)})
+
+    def _doctor_lineage(self, name: str, ov: Overlay, findings: list[dict]) -> None:
+        """DESIGN 3.7: the lineage behind the overlay key must be the registry's."""
+        data_dir = self.cwd / DATA_DIR_NAME / name
+        try:
+            runner = self._runner(data_dir)
+            if runner.needs_init(ov.state_key):
+                runner.init(self.backend, ov.state_key)
+            runner.ensure_backend_key(ov.state_key)
+            stored = runner.state_pull().get("lineage")
+        except Exception as exc:  # noqa: BLE001 - doctor reports, never fails
+            findings.append({"level": "warning", "code": "unreadable-state",
+                             "message": f"{name}: cannot read {ov.state_key}: {exc}"})
+            return
+        if stored != ov.lineage:
+            findings.append({"level": "error", "code": "lineage-mismatch",
+                             "message": f"{name}: state lineage {stored} differs from the "
+                                        f"registry ({ov.lineage}); every command on this "
+                                        "overlay will refuse to run"})
 
     def _doctor_repo(self, doc: RegistryDoc, findings: list[dict]) -> None:
         if not config.ensure_gitignored(self.repo_root, DATA_DIR_NAME + "/"):
