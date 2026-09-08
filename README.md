@@ -8,6 +8,7 @@ Status: **v1 (alpha)**. Target: OpenTofu >= 1.7 with the `s3` backend
 (DynamoDB lock and/or `use_lockfile`). Terraform >= 1.5 is best effort.
 Full design: [docs/DESIGN.md](docs/DESIGN.md). Hard limits:
 [docs/LIMITS.md](docs/LIMITS.md). CI wiring: [docs/CI.md](docs/CI.md).
+Multi-stack branches: [docs/MULTI-STACK.md](docs/MULTI-STACK.md).
 
 ## The problem: one sandbox, many branches
 
@@ -189,7 +190,36 @@ virtual_attributes: {}     # type -> [write-only attrs ignored at merge verify]
 
 `TF_VAR_tofu_overlay_name` is exported to every tofu run; declare a
 `tofu_overlay_name` variable if the config wants to know it (for example to
-suffix a physical name), otherwise it is ignored.
+suffix a physical name), otherwise it is ignored. `TF_VAR_tofu_overlay_keys`
+is exported alongside it for cross-stack reads, see below.
+
+## Multi-stack branches
+
+A branch that adds an output in stack A and reads it in stack B through
+`terraform_remote_state` would normally see A's **base** in B. When B's
+configuration adopts a small contract:
+
+```hcl
+variable "tofu_overlay_keys" {
+  type    = map(string)
+  default = {}
+}
+
+data "terraform_remote_state" "eks" {
+  backend = "s3"
+  config = {
+    bucket = "acme-tfstate"
+    key    = lookup(var.tofu_overlay_keys, "acme/webshop/eks/dev", "acme/webshop/eks/dev")
+    region = "eu-west-1"
+  }
+}
+```
+
+then B's `plan`/`apply` read A's overlay whenever A's base holds a live
+overlay of the same name (same branch), and fall back to the base otherwise;
+trunk pipelines never set the variable and are unaffected. Apply the producer
+first, finalize it first; `check` and `finalize` help with the ordering.
+Details, limits and the alternative by identity: [docs/MULTI-STACK.md](docs/MULTI-STACK.md).
 
 ## Safety invariants
 
@@ -232,6 +262,8 @@ Implemented in v1:
 - merge by `import {}` blocks with verification against the base state;
 - rebase (own created resources re-injected on a fresh base copy);
 - abandon, finalize, doctor, guard, gc, status/list/check with `--json`;
+- overlay-aware cross-stack `terraform_remote_state` reads
+  ([docs/MULTI-STACK.md](docs/MULTI-STACK.md));
 - CI mode (generic and Azure DevOps).
 
 Deferred, documented in [docs/LIMITS.md](docs/LIMITS.md) and

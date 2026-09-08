@@ -291,3 +291,113 @@ class TestDescribe:
         assert text.startswith(f"s3://{BUCKET}/{BASE_KEY}")
         for part in (REGION, "acme-dev", LOCK_TABLE, "lockfile"):
             assert part in text
+
+
+REMOTE_STATE_TF = f"""
+variable "tofu_overlay_keys" {{
+  type    = map(string)
+  default = {{}}
+}}
+
+data "terraform_remote_state" "eks" {{
+  backend = "s3"
+  config = {{
+    bucket = "{BUCKET}"
+    key    = lookup(var.tofu_overlay_keys, "acme/webshop/eks/dev", "acme/webshop/eks/dev")
+    region = "{REGION}"
+  }}
+}}
+
+data "terraform_remote_state" "network" {{
+  backend = "s3"
+  config = {{
+    bucket = "{BUCKET}"
+    key    = "acme/webshop/network/dev"
+    region = var.region
+  }}
+}}
+
+data "terraform_remote_state" "templated" {{
+  backend = "s3"
+  config = {{
+    bucket = "{BUCKET}"
+    key    = "acme/webshop/${{var.env}}/dev"
+  }}
+}}
+
+data "terraform_remote_state" "computed_bucket" {{
+  backend = "s3"
+  config = {{
+    bucket = var.state_bucket
+    key    = "acme/webshop/dns/dev"
+  }}
+}}
+
+data "terraform_remote_state" "azure" {{
+  backend = "azurerm"
+  config = {{
+    key = "acme.tfstate"
+  }}
+}}
+
+data "terraform_remote_state" "local" {{
+  backend = "local"
+  config = {{
+    path = "terraform.tfstate"
+  }}
+}}
+
+data "aws_caller_identity" "me" {{}}
+"""
+
+
+class TestParseRemoteStateRefs:
+    def test_resolved_refs_have_unquoted_values(self, env_dir: Path) -> None:
+        (env_dir / "remote.tf").write_text(REMOTE_STATE_TF, encoding="utf-8")
+        refs = {r.name: r for r in backend.parse_remote_state_refs(env_dir)}
+        eks = refs["eks"]
+        assert not eks.unresolved
+        assert eks.key == "acme/webshop/eks/dev"  # the lookup(var.tofu_overlay_keys, ...) contract
+        assert eks.bucket == BUCKET
+        assert eks.region == REGION
+        assert not any('"' in str(v) for v in eks.model_dump().values())
+
+    def test_expression_region_is_none_but_key_resolved(self, env_dir: Path) -> None:
+        (env_dir / "remote.tf").write_text(REMOTE_STATE_TF, encoding="utf-8")
+        refs = {r.name: r for r in backend.parse_remote_state_refs(env_dir)}
+        network = refs["network"]
+        assert not network.unresolved
+        assert network.key == "acme/webshop/network/dev"
+        assert network.region is None
+
+    def test_unresolved_key_or_bucket(self, env_dir: Path) -> None:
+        (env_dir / "remote.tf").write_text(REMOTE_STATE_TF, encoding="utf-8")
+        refs = {r.name: r for r in backend.parse_remote_state_refs(env_dir)}
+        assert refs["templated"].unresolved and refs["templated"].key is None
+        assert refs["computed_bucket"].unresolved and refs["computed_bucket"].key is None
+        assert refs["computed_bucket"].bucket is None
+
+    def test_non_s3_backends_are_skipped(self, env_dir: Path) -> None:
+        (env_dir / "remote.tf").write_text(REMOTE_STATE_TF, encoding="utf-8")
+        names = {r.name for r in backend.parse_remote_state_refs(env_dir)}
+        assert names == {"eks", "network", "templated", "computed_bucket"}
+
+    def test_no_refs(self, env_dir: Path) -> None:
+        assert backend.parse_remote_state_refs(env_dir) == []
+        assert backend.parse_remote_state_refs(env_dir / "missing") == []
+
+    def test_symlinked_file_is_followed(self, env_dir: Path, tmp_path: Path) -> None:
+        shared = tmp_path / "shared" / "remote.tf"
+        shared.parent.mkdir()
+        shared.write_text(REMOTE_STATE_TF, encoding="utf-8")
+        (env_dir / "remote.tf").symlink_to(shared)
+        assert {r.name for r in backend.parse_remote_state_refs(env_dir)} >= {"eks"}
+
+    def test_non_default_workspace_is_unresolved(self, env_dir: Path) -> None:
+        (env_dir / "remote.tf").write_text(
+            f'data "terraform_remote_state" "ws" {{\n  backend = "s3"\n  workspace = "qa"\n'
+            f'  config = {{\n    bucket = "{BUCKET}"\n    key = "acme/webshop/eks/dev"\n  }}\n}}\n',
+            encoding="utf-8",
+        )
+        (ref,) = backend.parse_remote_state_refs(env_dir)
+        assert ref.unresolved and ref.key is None

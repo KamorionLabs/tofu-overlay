@@ -197,6 +197,23 @@ class BackendConfig(BaseModel):
         return f"{self.bucket}/{path}-md5"
 
 
+class RemoteStateRef(BaseModel):
+    """One ``data "terraform_remote_state"`` block with an ``s3`` backend (MULTI-STACK.md).
+
+    ``key`` is the literal base key the block reads (or the map key of the
+    ``lookup(var.tofu_overlay_keys, ...)`` contract). ``unresolved`` is set when
+    the key or bucket is an expression the tool cannot evaluate; ``key`` is then
+    ``None``. ``bucket``/``region`` are ``None`` when absent or not literal
+    (the current backend's values apply).
+    """
+
+    name: str
+    bucket: str | None = None
+    key: str | None = None
+    region: str | None = None
+    unresolved: bool = False
+
+
 # --------------------------------------------------------------------------- #
 # Registry document
 # --------------------------------------------------------------------------- #

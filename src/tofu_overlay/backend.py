@@ -19,11 +19,12 @@ from typing import Any
 
 import hcl2
 
-from tofu_overlay.models import BackendConfig, ToolError
+from tofu_overlay.models import BackendConfig, RemoteStateRef, ToolError
 
 __all__ = [
     "BackendResolutionError",
     "parse_hcl_backend",
+    "parse_remote_state_refs",
     "parse_backend_config_files",
     "read_cached_backend",
     "resolve_backend",
@@ -32,6 +33,13 @@ __all__ = [
 
 SUPPORTED_BACKEND = "s3"
 BLOCK_MARKER = "__is_block__"
+REMOTE_STATE_TYPE = "terraform_remote_state"
+OVERLAY_KEYS_VAR = "tofu_overlay_keys"
+# The MULTI-STACK.md contract: key = lookup(var.tofu_overlay_keys, "<base key>", "<base key>").
+_OVERLAY_LOOKUP_RE = re.compile(
+    r'^\$\{\s*lookup\(\s*var\.' + OVERLAY_KEYS_VAR
+    + r'\s*,\s*"(?P<key>[^"]+)"\s*(?:,\s*"[^"]*"\s*)?\)\s*\}$'
+)
 ENV_OVERRIDES = {
     "TOFU_OVERLAY_BUCKET": "bucket",
     "TOFU_OVERLAY_KEY": "key",
@@ -137,6 +145,97 @@ def parse_hcl_backend(dir: Path) -> dict | None:  # noqa: A002 - name fixed by c
                 )
             result = attrs
     return result
+
+
+# --------------------------------------------------------------------------- #
+# terraform_remote_state references
+# --------------------------------------------------------------------------- #
+
+
+def _literal(value: Any) -> str | None:
+    """A cleaned HCL string that carries no ``${...}`` expression, else ``None``."""
+    if isinstance(value, str) and "${" not in value:
+        return value
+    return None
+
+
+def _ref_key(value: Any) -> str | None:
+    """Literal key, or the map key of the ``lookup(var.tofu_overlay_keys, ...)`` contract."""
+    literal = _literal(value)
+    if literal is not None:
+        return literal
+    if isinstance(value, str):
+        match = _OVERLAY_LOOKUP_RE.match(value.strip())
+        if match:
+            return match.group("key")
+    return None
+
+
+def _remote_state_entries(parsed: dict) -> list[tuple[str, dict]]:
+    """Yield ``(name, attrs)`` for every ``data "terraform_remote_state"`` block."""
+    entries: list[tuple[str, dict]] = []
+    for data_block in _blocks(parsed, "data"):
+        for type_label, by_name in data_block.items():
+            if type_label == BLOCK_MARKER or _unquote(type_label) != REMOTE_STATE_TYPE:
+                continue
+            if not isinstance(by_name, dict):
+                continue
+            for name_label, body in by_name.items():
+                if name_label == BLOCK_MARKER:
+                    continue
+                attrs = _clean(body) if isinstance(body, dict) else {}
+                entries.append((_unquote(name_label), attrs))
+    return entries
+
+
+def _remote_config(attrs: dict) -> dict:
+    """The ``config`` map of a remote_state block (attribute or block syntax)."""
+    cfg = attrs.get("config")
+    if isinstance(cfg, list):
+        cfg = next((c for c in cfg if isinstance(c, dict)), None)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _to_remote_ref(name: str, attrs: dict) -> RemoteStateRef:
+    cfg = _remote_config(attrs)
+    bucket_raw, key_raw = cfg.get("bucket"), cfg.get("key")
+    bucket, key = _literal(bucket_raw), _ref_key(key_raw)
+    workspace = _literal(cfg.get("workspace") or attrs.get("workspace")) or "default"
+    unresolved = key is None or (bucket_raw is not None and bucket is None) or (
+        workspace != "default"
+    )
+    return RemoteStateRef(
+        name=name,
+        bucket=bucket,
+        key=None if unresolved else key,
+        region=_literal(cfg.get("region")),
+        unresolved=unresolved,
+    )
+
+
+def parse_remote_state_refs(dir: Path) -> list[RemoteStateRef]:  # noqa: A002 - contract
+    """Every ``data "terraform_remote_state"`` block with an ``s3`` backend in ``dir``.
+
+    Symlinked ``*.tf`` files are followed. Blocks with another backend are
+    skipped. A key or bucket given as an expression (other than the
+    ``lookup(var.tofu_overlay_keys, "<key>", ...)`` contract) yields an
+    ``unresolved`` reference with ``key`` set to ``None``.
+    """
+    dir = Path(dir)
+    if not dir.is_dir():
+        return []
+    refs: list[RemoteStateRef] = []
+    for tf in sorted(dir.glob("*.tf")):
+        if not tf.is_file():
+            continue
+        parsed = _parse_tf_file(tf)
+        if not parsed:
+            continue
+        for name, attrs in _remote_state_entries(parsed):
+            if _literal(attrs.get("backend")) != SUPPORTED_BACKEND:
+                continue
+            refs.append(_to_remote_ref(name, attrs))
+    return refs
 
 
 # --------------------------------------------------------------------------- #

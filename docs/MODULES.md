@@ -25,6 +25,7 @@ class ToolConfig(BaseModel): policy:PolicyConfig; binary:str="tofu"; identity:di
 class ResourceChange(BaseModel): address; previous_address:str|None; module_address:str|None; mode:str|None; type; name; index:Any; deposed:str|None; actions:list[str]; before:Any; after:Any; after_unknown:Any; before_sensitive:Any; after_sensitive:Any; replace_paths:list; importing:dict|None; action_reason:str|None   # mode ("managed"/"data") is authoritative for data-source detection
 class PlanSummary(BaseModel): create:int=0; update:int=0; delete:int=0; replace:int=0; import_:int=0 (alias "import"); no_op:int=0
 class Violation(BaseModel): address:str; rule:str; message:str; other_overlay:str|None
+class RemoteStateRef(BaseModel): name:str; bucket:str|None; key:str|None; region:str|None; unresolved:bool=False   # one data "terraform_remote_state" (s3) block; unresolved -> key None
 class PolicyResult(BaseModel): violations:list[Violation]; warnings:list[str]; claims:dict[str,Claim]  # claims to acquire on apply
     # ok -> bool
 class BackendInfo / misc small models as needed.
@@ -56,6 +57,7 @@ def ensure_gitignored(repo_root: Path, entry: str) -> bool        # True if `.to
 ```python
 class BackendResolutionError(ToolError)
 def parse_hcl_backend(dir: Path) -> dict | None            # scan *.tf (not symlink-following issues: follow symlinks fine) for terraform{backend "s3"{}}; python-hcl2 8.x returns quoted strings ("\"x\"") -> strip quotes; return raw dict of attrs; azurerm/other backend -> error naming it
+def parse_remote_state_refs(dir: Path) -> list[RemoteStateRef]   # every data "terraform_remote_state" with backend = "s3" in *.tf (symlinks followed); config.bucket/key/region unquoted; key literal or the `lookup(var.tofu_overlay_keys, "<key>", ...)` contract -> resolved; any other expression (or a bucket expression, or a non-default workspace) -> unresolved=True, key None; other backends skipped
 def parse_backend_config_files(files: list[Path]) -> dict    # key=value and HCL files (tofu -backend-config syntax)
 def read_cached_backend(data_dir: Path) -> dict | None      # <data_dir>/terraform.tfstate JSON: {"backend": {"type": "s3", "config": {...}}}
 def resolve_backend(cwd: Path, *, overrides: dict, backend_config_files: list[Path], data_dir: Path|None) -> BackendConfig
@@ -202,6 +204,7 @@ class OverlayService:
     def finalize(self, *, purge: bool, yes: bool) -> None
     def gc(self, *, purge: bool, yes: bool) -> list[dict]
     def doctor(self) -> list[dict]                          # findings [{level, code, message}]
+    def remote_overlay_keys(self, name: str) -> dict[str, str]   # {ref base key -> overlay state_key} for every resolved remote_state ref whose base registry holds a live overlay `name` with an existing object; own base ignored; missing registry = {}; registry error = warning + skip. Read-only. Exported as TF_VAR_tofu_overlay_keys (JSON) with TF_VAR_tofu_overlay_name to every tofu run
     # internals expected (private): _validate_overlay(ov) (§3.7), _freshness(ov) -> (stale: bool, current_etag), _base_addresses(refresh: bool) cached under base_data_dir/base_addresses.json, _base_identities(), _pull_base(), _runner(data_dir) etc.
 ```
 

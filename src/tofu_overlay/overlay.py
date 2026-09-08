@@ -23,6 +23,7 @@ from typing import Any
 from tofu_overlay import __version__, config
 from tofu_overlay import plan as planmod
 from tofu_overlay import state as statemod
+from tofu_overlay.backend import parse_remote_state_refs, resolve_backend
 from tofu_overlay.identity import TypeKnowledge
 from tofu_overlay.models import (
     BackendConfig,
@@ -37,6 +38,7 @@ from tofu_overlay.models import (
     PolicyResult,
     RegistryDoc,
     RegistryError,
+    RemoteStateRef,
     StaleError,
     Status,
     ToolConfig,
@@ -56,6 +58,8 @@ BASE_CACHE_FILE = "base_addresses.json"
 ARCHIVE_RE = re.compile(r"@(?P<name>[a-z0-9-]+)\.(?P<status>merged|abandoned|rebase)-\d{8}T\d{6}Z")
 IMPORTS_GLOB = "zz_overlay_*.imports.tf"
 PLAN_GLOB = "tfplan.*"
+NAME_VAR = "TF_VAR_tofu_overlay_name"
+REMOTE_KEYS_VAR = "TF_VAR_tofu_overlay_keys"
 
 # Statuses that count as "live" in conflict checks (DESIGN 3.4).
 _LIVE = {Status.CREATING, Status.ACTIVE, Status.APPLYING, Status.DIRTY, Status.MERGING}
@@ -151,6 +155,10 @@ class OverlayService:
         self._registry: Registry | None = None
         self._knowledge: TypeKnowledge | None = None
         self._repo_root: Path | None = None
+        # Cross-stack remote_state links, computed once per command (MULTI-STACK.md).
+        self._remote_refs_cache: list[RemoteStateRef] | None = None
+        self._remote_links_cache: list[dict[str, Any]] | None = None
+        self._remote_warnings: list[str] = []
         # Injectable subprocess entry point for the few git calls config.py does not cover.
         self.git_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
 
@@ -243,11 +251,13 @@ class OverlayService:
     # ------------------------------------------------------------------ runners
 
     def _env(self) -> dict[str, str]:
-        """TF_VAR_tofu_overlay_name is exported to every tofu run (DESIGN 6)."""
+        """Overlay name and remote overlay keys exported to every tofu run (DESIGN 6)."""
         try:
-            return {"TF_VAR_tofu_overlay_name": self.name}
+            name = self.name
         except OverlayError:
             return {}
+        keys = json.dumps(self.remote_overlay_keys(name), sort_keys=True)
+        return {NAME_VAR: name, REMOTE_KEYS_VAR: keys}
 
     def _runner(self, data_dir: Path) -> TofuRunner:
         """Build a tofu runner bound to a data dir (injectable through runner_factory)."""
@@ -371,6 +381,171 @@ class OverlayService:
             raise RegistryError(
                 f"base lineage changed ({recorded} -> {pulled}); every overlay of this base "
                 "needs review"
+            )
+
+    # ------------------------------------------------------------------ remote state links
+
+    def _remote_refs(self) -> list[RemoteStateRef]:
+        if self._remote_refs_cache is None:
+            self._remote_refs_cache = parse_remote_state_refs(self.cwd)
+        return self._remote_refs_cache
+
+    def _remote_backend(self, ref: RemoteStateRef) -> BackendConfig:
+        """Backend of the base a ref reads: current backend with the ref's bucket/key/region."""
+        return self.backend.model_copy(
+            update={
+                "bucket": ref.bucket or self.backend.bucket,
+                "key": ref.key,
+                "region": ref.region or self.backend.region,
+                "backend_config_files": [],
+            }
+        )
+
+    def _is_own_base(self, cfg: BackendConfig) -> bool:
+        return cfg.bucket == self.backend.bucket and cfg.state_path() == self.base_key
+
+    def _remote_overlay(self, cfg: BackendConfig, name: str) -> Overlay | None:
+        """Live overlay ``name`` registered on another base (``None`` when absent).
+
+        A missing registry means no overlays; registry errors bubble up.
+        """
+        s3 = S3State(cfg, session=self._session)
+        doc, _etag = Registry(s3, cfg, __version__).load()
+        ov = doc.overlays.get(name)
+        if ov is None or ov.status not in _LIVE:
+            return None
+        return ov
+
+    def _remote_link(self, ref: RemoteStateRef, name: str) -> dict[str, Any] | None:
+        cfg = self._remote_backend(ref)
+        if self._is_own_base(cfg):
+            return None
+        ov = self._remote_overlay(cfg, name)
+        if ov is None:
+            return None
+        exists = S3State(cfg, session=self._session).head(ov.state_key) is not None
+        return {
+            "ref": ref.name,
+            "bucket": cfg.bucket,
+            "key": cfg.key,
+            "overlay_key": ov.state_key,
+            "status": str(ov.status),
+            "exists": exists,
+        }
+
+    def _remote_links(self, name: str) -> list[dict[str, Any]]:
+        """Refs of this stack that resolve to a live overlay ``name`` on another base (cached)."""
+        if self._remote_links_cache is not None:
+            return self._remote_links_cache
+        links: list[dict[str, Any]] = []
+        for ref in self._remote_refs():
+            if ref.unresolved:
+                self._remote_warnings.append(
+                    f"remote state {ref.name}: key is not a literal, it cannot be mapped to an "
+                    "overlay (the base is read)"
+                )
+                continue
+            try:
+                link = self._remote_link(ref, name)
+            except OverlayError as exc:
+                self._remote_warnings.append(f"remote state {ref.name}: skipped ({exc})")
+                continue
+            if link is not None:
+                links.append(link)
+        self._remote_links_cache = links
+        return links
+
+    def remote_overlay_keys(self, name: str) -> dict[str, str]:
+        """``{base key -> overlay key}`` for refs whose base holds a live overlay ``name``.
+
+        Read-only. Only overlays whose state object exists are mapped; refs to
+        this stack's own base, unresolved refs and unreadable registries are
+        skipped (the latter two are reported as warnings by ``plan``/``check``).
+        """
+        return {
+            link["key"]: link["overlay_key"] for link in self._remote_links(name) if link["exists"]
+        }
+
+    def _report_remote_overlays(self) -> None:
+        """One line per mapped ref plus the warnings collected while resolving them."""
+        for warning in self._remote_warnings:
+            self.console.warn(warning)
+        for link in self._remote_links(self.name):
+            if link["exists"]:
+                self.console.info(
+                    f"remote state {link['ref']}: reading overlay {link['overlay_key']}"
+                )
+            else:
+                self.console.warn(
+                    f"remote state {link['ref']}: overlay object {link['overlay_key']} is "
+                    "missing, the base is read"
+                )
+
+    def _check_remote_links(self, errors: list[str], warnings: list[str]) -> None:
+        links = self._remote_links(self.name)
+        warnings += self._remote_warnings
+        for link in links:
+            where = f"remote state {link['ref']} ({link['key']})"
+            if not link["exists"]:
+                errors.append(f"{where}: overlay object {link['overlay_key']} no longer exists")
+            elif link["status"] == Status.MERGING:
+                warnings.append(
+                    f"{where}: reads overlay {link['overlay_key']} which is merging and will "
+                    "disappear at its finalize; re-plan this overlay afterwards"
+                )
+
+    def _sibling_env_dirs(self, root: Path) -> list[Path]:
+        me = self.cwd.resolve()
+        return sorted(
+            p
+            for p in root.glob(self.cfg.policy.env_dir_glob)
+            if p.is_dir() and p.resolve() != me and config.symlinked_ancestor(p) is None
+        )
+
+    def _refs_to_own_base(self, env_dir: Path) -> list[RemoteStateRef]:
+        try:
+            refs = parse_remote_state_refs(env_dir)
+        except OverlayError:
+            return []
+        return [
+            r
+            for r in refs
+            if not r.unresolved
+            and r.key == self.base_key
+            and (r.bucket or self.backend.bucket) == self.backend.bucket
+        ]
+
+    def _consumer_overlay(self, env_dir: Path, name: str) -> tuple[BackendConfig, Overlay] | None:
+        """Live overlay ``name`` of the stack in ``env_dir``; best effort, ``None`` on error."""
+        try:
+            cfg = resolve_backend(
+                env_dir, overrides={}, backend_config_files=[], data_dir=env_dir / ".terraform"
+            )
+            if self._is_own_base(cfg):
+                return None
+            ov = self._remote_overlay(cfg, name)
+        except OverlayError:
+            return None
+        return None if ov is None else (cfg, ov)
+
+    def _warn_consumers(self, ov: Overlay) -> None:
+        """finalize: warn about live overlays of sibling stacks reading this base (best effort)."""
+        root = config.find_repo_root(self.cwd)
+        if root is None:
+            return
+        for env_dir in self._sibling_env_dirs(root):
+            refs = self._refs_to_own_base(env_dir)
+            if not refs:
+                continue
+            found = self._consumer_overlay(env_dir, ov.name)
+            if found is None:
+                continue
+            cfg, _consumer = found
+            names = ", ".join(r.name for r in refs)
+            self.console.warn(
+                f"overlay '{ov.name}' on s3://{cfg.bucket}/{cfg.key} "
+                f"({os.path.relpath(env_dir, root)}) reads this base through remote state "
+                f"{names}; re-plan it after finalize (it falls back to the base automatically)"
             )
 
     # ------------------------------------------------------------------ validation (3.7)
@@ -688,6 +863,7 @@ class OverlayService:
         validate_passthrough(extra)
         doc, ov = self._load()
         status = self._gate(ov, {Status.ACTIVE, Status.DIRTY, Status.MERGING}, "plan")
+        self._report_remote_overlays()
         if status == Status.MERGING:
             return self._verify_mode(ov)
         self._validate_overlay(ov)
@@ -882,6 +1058,7 @@ class OverlayService:
                      "lineage": doc.base.get("lineage")},
             "registry_key": self.registry.key,
             "current": current if current in doc.overlays else None,
+            "remote_overlays": self.remote_overlay_keys(current) if current else {},
             "overlays": [
                 self._overlay_row(ov, base_etag) for _, ov in sorted(doc.overlays.items())
             ],
@@ -936,6 +1113,7 @@ class OverlayService:
         for v in self.registry.conflicts_for(doc, self.name, ov.claims):
             errors.append(f"conflict: {v.address} {v.message} (overlay {v.other_overlay})")
         errors += self._check_imports_file(ov)
+        self._check_remote_links(errors, warnings)
         return not errors, errors, warnings
 
     def _check_imports_file(self, ov: Overlay) -> list[str]:
@@ -1127,6 +1305,7 @@ class OverlayService:
             raise PolicyError(
                 "the trunk created its own objects for: " + "; ".join(different)
             )
+        self._warn_consumers(ov)
         self._confirm_typed("finalize", yes=yes)
         if purge:
             self.console.info("--purge: no archive kept")

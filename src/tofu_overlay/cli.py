@@ -311,7 +311,8 @@ def plan(
         extra = list(tofu_args or [])
         validate_passthrough(extra)
         setup = _setup(ctx, mutating=False)
-        policy, summary, planfile, stale = setup.service().plan(
+        svc = setup.service()
+        policy, summary, planfile, stale = svc.plan(
             extra=extra, allow_behind=allow_behind, detailed_exitcode=detailed_exitcode
         )
         summary_dict = summary.model_dump(by_alias=True)
@@ -323,6 +324,7 @@ def plan(
                 "summary": summary_dict,
                 "planfile": str(planfile),
                 "stale": stale,
+                "remote_overlays": svc.remote_overlay_keys(svc.name),
             },
             lambda: None,
         )
@@ -345,14 +347,22 @@ def apply(
         setup = _setup(ctx, mutating=True)
         if auto_approve and not (config.is_ci() or setup.g.yes):
             raise PolicyError("--auto-approve requires --yes outside CI")
-        ov = setup.service().apply(
+        svc = setup.service()
+        ov = svc.apply(
             auto_approve=auto_approve,
             allow_stale=allow_stale,
             allow_behind=allow_behind,
             extra=list(tofu_args or []),
             yes=setup.g.yes,
         )
-        _emit(setup, {"overlay": ov.model_dump(mode="json")}, lambda: None)
+        _emit(
+            setup,
+            {
+                "overlay": ov.model_dump(mode="json"),
+                "remote_overlays": svc.remote_overlay_keys(svc.name),
+            },
+            lambda: None,
+        )
         return 0
 
     _run(ctx, body)
@@ -380,6 +390,8 @@ def status(
                     f"{payload['base']['bucket']}/{payload['base']['key']}"
                     + (f" (current: {payload['current']})" if payload["current"] else ""),
                 )
+                for key, overlay_key in sorted(payload["remote_overlays"].items()):
+                    setup.console.info(f"remote state {key}: reading overlay {overlay_key}")
         if setup.g.json:
             setup.console.json({"bases": payloads} if repo else payloads[0])
         return 0

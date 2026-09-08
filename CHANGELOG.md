@@ -14,6 +14,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   commented example configuration (.tofu-overlay.example.yaml).
 - Package scaffolding, GitHub Actions CI (ruff + pytest on 3.11/3.12), MIT
   license.
+- Overlay-aware cross-stack `terraform_remote_state` reads (multi-stack PR):
+  `backend.parse_remote_state_refs`, `OverlayService.remote_overlay_keys`,
+  `TF_VAR_tofu_overlay_keys` (JSON map `base key -> overlay key`) exported to
+  every tofu run of an overlay, `remote_overlays` in `--json` output of
+  `plan`/`apply`/`status`, `check` warnings/errors on mapped overlays,
+  `finalize` warning about consumer overlays of sibling stacks. Documented in
+  docs/MULTI-STACK.md; LIMITS.md §7 rewritten accordingly.
 
 ### Fixed
 

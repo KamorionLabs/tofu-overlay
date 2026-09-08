@@ -109,7 +109,10 @@ All commands run from the stack's env directory (`-C/--chdir` accepted). Backend
 
 Exit codes (all commands): 0 ok (changes are reported, not signalled), 1 tool/tofu error, 3 policy violation, 4 stale or behind trunk, 5 registry conflict/unreachable/invalid, 6 base key not allowed or overlay not found, 7 overlay frozen (`merging`). `--detailed-exitcode` on `plan` restores 2 for "changes present". CI = `CI=true` or `TF_BUILD=True`: no colour, `##vso[task.logissue]` lines on ADO, `--allow-stale`/`--allow-behind` refused, `--yes` accepted for `apply`. `--json` output on `plan`, `check`, `status`, `list`, `doctor` (versioned `schema: 1`).
 
-`TF_VAR_tofu_overlay_name` is exported to every tofu run (ignored when undeclared).
+Two variables are exported to every tofu run of an overlay (plan, apply, the destroy plan of `abandon`, the verify plan of `merge`); both are ignored when undeclared:
+
+- `TF_VAR_tofu_overlay_name`: the overlay name;
+- `TF_VAR_tofu_overlay_keys`: a JSON object `{"<base key>": "<overlay key>"}` for every `data "terraform_remote_state"` (`s3` backend) of the env dir whose base holds a live overlay of the same name with an existing state object (`{}` otherwise). Refs to the stack's own base, unresolved keys and unreadable registries are skipped and reported. The stack opts in with `key = lookup(var.tofu_overlay_keys, "<base key>", "<base key>")`, see [MULTI-STACK.md](MULTI-STACK.md). `plan`/`apply` print one line per mapped ref and `--json` carries `remote_overlays`; `status` shows the map; `check` warns when a mapped overlay is `merging` and errors when its object is gone; `finalize` warns (best effort, over `policy.env_dir_glob`) about live overlays of sibling stacks that read the finalized base.
 
 ## 7. Policy checks (plan JSON)
 
@@ -190,5 +193,5 @@ src/tofu_overlay/
   models.py       pydantic models, enums, exit codes
   data/identity.yaml  data/import_ids.yaml
 tests/            pytest + moto; fixtures/ (plan/state JSON)
-docs/DESIGN.md LIMITS.md CI.md SYNC-PROPOSAL.md
+docs/DESIGN.md LIMITS.md CI.md MULTI-STACK.md SYNC-PROPOSAL.md
 ```

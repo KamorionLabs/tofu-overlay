@@ -82,17 +82,33 @@ state whose encryption configuration is not available in the working
 directory. `is_encrypted()` on a raw document is only used by `doctor` to
 report it.
 
-## 7. Cross-stack `terraform_remote_state` reads the base
+## 7. Cross-stack `terraform_remote_state` follows the overlay only under a contract
 
 A stack that reads another stack's outputs with `terraform_remote_state`
-(or an equivalent data source) points at the other stack's **base** key. It
-does not know the overlay of a sibling stack on the same branch. A branch
-that adds an output in stack A and consumes it in stack B will see the old
-output in B until A is merged and applied by the trunk.
+points at the other stack's **base** key. The tool does not rewrite that key:
+it exports `TF_VAR_tofu_overlay_keys` (`base key -> overlay key` for every
+`s3` reference whose base holds a live overlay of the same name, i.e. the
+same branch) and the configuration must opt in with
+`key = lookup(var.tofu_overlay_keys, "<base key>", "<base key>")`. Trunk
+pipelines never set the variable and keep reading the base. See
+[MULTI-STACK.md](MULTI-STACK.md).
 
-Lifting this needs stacked or linked overlays (`create --base-overlay`, or
-a rewriting of `remote_state` keys per overlay) and is discussed in
-[SYNC-PROPOSAL.md](SYNC-PROPOSAL.md).
+Caveats:
+
+- a stack that does not adopt the contract keeps reading the base and sees
+  the producer's new outputs only after the producer is merged and applied
+  by the trunk;
+- a reference whose key or bucket is an expression the tool cannot evaluate
+  is reported and cannot be mapped;
+- the producer overlay must be applied before the consumer plans, and
+  finalized before the consumer (the consumer's next plan falls back to the
+  base automatically; `finalize` on the producer warns, best effort, about
+  live consumer overlays of the repository);
+- only `terraform_remote_state` with the `s3` backend and the default
+  workspace is understood; data sources by identity need nothing.
+
+Stacked overlays on the *same* stack (`create --base-overlay`) remain deferred,
+see [SYNC-PROPOSAL.md](SYNC-PROPOSAL.md).
 
 ## 8. Non-importable resource types cannot be merged
 

@@ -31,12 +31,14 @@ from tofu_overlay.models import (
     ToolError,
 )
 from tofu_overlay.output import Console
-from tofu_overlay.overlay import OverlayService
+from tofu_overlay.overlay import REMOTE_KEYS_VAR, OverlayService
 
 BRANCH = "feature/ABC-12-reports"
 NEW_ADDRESS = "aws_s3_bucket.reports"
 NEW_BUCKET = "acme-reports-overlay"
 PROVIDER = 'provider["registry.opentofu.org/hashicorp/aws"]'
+EKS_KEY = "acme/webshop/eks/dev"
+LAMBDA_KEY = "acme/webshop/lambda/dev"
 
 
 class FakeRunner:
@@ -45,6 +47,7 @@ class FakeRunner:
     session: Any = None
     desired: dict[str, dict[str, Any]] = {}
     calls: list[list[str]] = []
+    envs: list[dict[str, str]] = []
 
     def __init__(self, binary: str, cwd: Path, data_dir: Path, env=None, stream=None) -> None:
         self.binary = binary
@@ -53,6 +56,7 @@ class FakeRunner:
         self.env = dict(env or {})
         self.stream = stream
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        FakeRunner.envs.append(self.env)
 
     # ------------------------------------------------------------ backend
     @property
@@ -222,6 +226,7 @@ def base_in_s3(s3_client, state_base: dict) -> dict:
 def fake_runner(boto_session, base_in_s3: dict):
     FakeRunner.session = boto_session
     FakeRunner.calls = []
+    FakeRunner.envs = []
     desired: dict[str, dict[str, Any]] = {}
     for address, (entry, _inst) in statemod.index_instances(base_in_s3).items():
         if entry.get("mode") == "managed":
@@ -262,20 +267,24 @@ def _other_service(env_repo: Path, backend_cfg, boto_session, fake_runner, conso
 
 
 def _adopt_in_base(
-    s3_client, overlay_key: str, address: str, attrs: dict[str, Any] | None = None
+    s3_client,
+    overlay_key: str,
+    address: str,
+    attrs: dict[str, Any] | None = None,
+    base_key: str = BASE_KEY,
 ) -> None:
     """Simulate the trunk applying the imports: copy the instance into the base state.
 
     ``attrs`` overrides instance attributes (a different ``id`` simulates the
     trunk creating its own object instead of importing).
     """
-    base = json.loads(s3_client.get_object(Bucket=BUCKET, Key=BASE_KEY)["Body"].read())
+    base = json.loads(s3_client.get_object(Bucket=BUCKET, Key=base_key)["Body"].read())
     overlay = json.loads(s3_client.get_object(Bucket=BUCKET, Key=overlay_key)["Body"].read())
     entry, inst = statemod.index_instances(overlay)[address]
     inst = {**inst, "attributes": {**inst.get("attributes", {}), **(attrs or {})}}
     base["resources"].append({**entry, "instances": [inst]})
     base["serial"] += 1
-    s3_client.put_object(Bucket=BUCKET, Key=BASE_KEY, Body=json.dumps(base).encode())
+    s3_client.put_object(Bucket=BUCKET, Key=base_key, Body=json.dumps(base).encode())
 
 
 def _move_base(s3_client, base_in_s3: dict) -> dict:
@@ -697,6 +706,146 @@ class TestMerge:
         assert _status_of(service) == Status.ACTIVE
 
 
+# ---------------------------------------------------------------------- multi-stack
+
+
+def _backend_block(key: str) -> str:
+    return (
+        f'terraform {{\n  backend "s3" {{\n    bucket         = "{BUCKET}"\n'
+        f'    key            = "{key}"\n    region         = "{REGION}"\n'
+        f'    dynamodb_table = "{LOCK_TABLE}"\n  }}\n}}\n\n'
+    )
+
+
+REMOTE_STATE_BLOCK = f"""
+variable "tofu_overlay_keys" {{
+  type    = map(string)
+  default = {{}}
+}}
+
+data "terraform_remote_state" "eks" {{
+  backend = "s3"
+  config = {{
+    bucket = "{BUCKET}"
+    key    = lookup(var.tofu_overlay_keys, "{EKS_KEY}", "{EKS_KEY}")
+    region = "{REGION}"
+  }}
+}}
+"""
+
+
+@pytest.fixture
+def multi_stack(env_repo, s3_client, base_in_s3, backend_cfg, boto_session, fake_runner, console):
+    """Producer stack ``eks`` and consumer stack ``lambda`` (reads eks through remote_state).
+
+    Returns a factory building a fresh service for ``"eks"`` or ``"lambda"``; a
+    fresh instance per step mirrors one CLI invocation (links are cached per
+    instance).
+    """
+    repo = env_repo.parents[3]
+    dirs = {"eks": repo / "stacks" / "eks" / "env" / "dev",
+            "lambda": repo / "stacks" / "lambda" / "env" / "dev"}
+    keys = {"eks": EKS_KEY, "lambda": LAMBDA_KEY}
+    for kind, d in dirs.items():
+        d.mkdir(parents=True)
+        body = 'resource "aws_s3_bucket" "reports" {}\n' if kind == "eks" else REMOTE_STATE_BLOCK
+        (d / "main.tf").write_text(_backend_block(keys[kind]) + body)
+        s3_client.put_object(Bucket=BUCKET, Key=keys[kind], Body=json.dumps(base_in_s3).encode())
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "eks and lambda stacks", cwd=repo)
+    cfg = config.load_config(env_repo)
+
+    def make(kind: str) -> OverlayService:
+        return OverlayService(
+            dirs[kind], cfg, backend_cfg.model_copy(update={"key": keys[kind]}), console,
+            session=boto_session, runner_factory=fake_runner,
+        )
+
+    return make
+
+
+def _plan_env(service) -> dict[str, str]:
+    """Run a plan and return the env of the runner that executed it."""
+    FakeRunner.envs.clear()
+    policy, _summary, _planfile, _stale = service.plan()
+    assert policy.ok, policy.violations
+    plan_env = [e for e in FakeRunner.envs if REMOTE_KEYS_VAR in e]
+    assert plan_env, "no runner received the overlay variables"
+    assert all(e == plan_env[0] for e in plan_env)
+    return plan_env[0]
+
+
+class TestMultiStack:
+    def test_consumer_reads_producer_overlay_until_finalize(
+        self, multi_stack, s3_client, console
+    ):
+        name = config.overlay_name_for(BRANCH)
+        # No producer overlay yet: the consumer reads the base.
+        consumer = multi_stack("lambda")
+        consumer.create()
+        assert json.loads(_plan_env(consumer)[REMOTE_KEYS_VAR]) == {}
+
+        producer = multi_stack("eks")
+        _created_and_applied(producer)
+        producer_key = producer.overlay_key
+        assert producer_key == f"{EKS_KEY}@{name}"
+
+        consumer = multi_stack("lambda")
+        env = _plan_env(consumer)
+        assert json.loads(env[REMOTE_KEYS_VAR]) == {EKS_KEY: producer_key}
+        assert f"remote state eks: reading overlay {producer_key}" in console.stderr.getvalue()
+        assert consumer.status()["remote_overlays"] == {EKS_KEY: producer_key}
+        ok, errors, warnings = consumer.check()
+        assert ok, errors
+        assert not any("merging" in w for w in warnings)
+
+        # The producer freezes: the consumer still reads it, check says so.
+        _merged(producer)
+        consumer = multi_stack("lambda")
+        ok, errors, warnings = consumer.check()
+        assert ok, errors
+        assert any("merging" in w and producer_key in w for w in warnings)
+        assert json.loads(_plan_env(consumer)[REMOTE_KEYS_VAR]) == {EKS_KEY: producer_key}
+
+        # Finalize warns about the consumer overlay, then the consumer falls back to the base.
+        _adopt_in_base(s3_client, producer_key, NEW_ADDRESS, base_key=EKS_KEY)
+        before = len(console.stderr.getvalue())
+        producer.finalize(purge=False, yes=True)
+        finalize_output = console.stderr.getvalue()[before:]
+        assert "re-plan it after finalize" in finalize_output
+        assert LAMBDA_KEY in finalize_output and "remote state eks" in finalize_output
+        assert "stacks/lambda/env/dev" in finalize_output
+
+        consumer = multi_stack("lambda")
+        assert json.loads(_plan_env(consumer)[REMOTE_KEYS_VAR]) == {}
+        ok, errors, warnings = consumer.check()
+        assert ok, errors
+
+    def test_consumer_check_errors_when_producer_object_vanished(
+        self, multi_stack, s3_client
+    ):
+        producer = multi_stack("eks")
+        producer.create()
+        consumer = multi_stack("lambda")
+        consumer.create()
+        s3_client.delete_object(Bucket=BUCKET, Key=producer.overlay_key)
+        consumer = multi_stack("lambda")
+        assert consumer.remote_overlay_keys(consumer.name) == {}
+        ok, errors, _warnings = consumer.check()
+        assert not ok
+        assert any("no longer exists" in e and producer.overlay_key in e for e in errors)
+
+    def test_finalize_without_consumer_overlay_does_not_warn(
+        self, multi_stack, s3_client, console
+    ):
+        producer = multi_stack("eks")
+        _created_and_applied(producer)
+        _merged(producer)
+        _adopt_in_base(s3_client, producer.overlay_key, NEW_ADDRESS, base_key=EKS_KEY)
+        producer.finalize(purge=False, yes=True)
+        assert "re-plan it after finalize" not in console.stderr.getvalue()
+
+
 # ---------------------------------------------------------------------- cli
 
 
@@ -760,6 +909,22 @@ class TestCli:
         result = _invoke(cli_env, "--json", "check")
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout)["ok"] is True
+
+    def test_json_plan_and_status_carry_remote_overlays(self, cli_env, multi_stack):
+        producer = multi_stack("eks")
+        producer.create()
+        lambda_dir = cli_env.parents[3] / "stacks" / "lambda" / "env" / "dev"
+        assert _invoke(lambda_dir, "create", key=LAMBDA_KEY).exit_code == 0
+        result = _invoke(lambda_dir, "--json", "plan", key=LAMBDA_KEY)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["remote_overlays"] == {EKS_KEY: producer.overlay_key}
+        assert f"reading overlay {producer.overlay_key}" in result.output
+        result = _invoke(lambda_dir, "--json", "status", key=LAMBDA_KEY)
+        assert json.loads(result.stdout)["remote_overlays"] == {EKS_KEY: producer.overlay_key}
+        result = _invoke(lambda_dir, "status", key=LAMBDA_KEY)
+        assert result.exit_code == 0, result.output
+        assert f"remote state {EKS_KEY}: reading overlay {producer.overlay_key}" in result.output
 
     def test_auto_approve_requires_yes(self, cli_env):
         assert _invoke(cli_env, "create").exit_code == 0
