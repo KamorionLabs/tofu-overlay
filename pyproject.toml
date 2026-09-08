@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kmr-tofu-overlay"
+version = "0.1.0"
+description = "Copy-on-write state overlays for OpenTofu/Terraform: apply a branch on a shared environment without polluting the trunk state, with cross-overlay conflict detection and resource claims."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Kamorion" }]
+keywords = ["opentofu", "terraform", "state", "overlay", "gitops", "iac"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "boto3>=1.34",
+    "python-hcl2>=4.3",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "moto[s3,dynamodb]>=5.0",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/kamorionlabs/tofu-overlay"
+Issues = "https://github.com/kamorionlabs/tofu-overlay/issues"
+
+[project.scripts]
+tofu-overlay = "tofu_overlay.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tofu_overlay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

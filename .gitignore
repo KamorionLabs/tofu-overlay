@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.tofu-overlay/
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan*
+.DS_Store
