@@ -1,0 +1,77 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install 3.12
+      - name: Check tag matches package version
+        run: |
+          set -euo pipefail
+          PKG=$(grep -E '^version = ' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          TAG="${GITHUB_REF_NAME#v}"
+          [ "$PKG" = "$TAG" ] || { echo "pyproject version $PKG != tag $TAG"; exit 1; }
+      - name: Build wheel and sdist
+        run: uv build
+      - name: Build linux/amd64 binary
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .build-venv
+          uv pip install --python .build-venv/bin/python dist/*.whl pyinstaller
+          .build-venv/bin/pyinstaller --onefile --clean --name tofu-overlay \
+            --collect-data tofu_overlay --copy-metadata kmr-tofu-overlay \
+            --distpath dist/bin scripts/pyinstaller_entry.py
+          mv dist/bin/tofu-overlay dist/tofu-overlay-linux-amd64
+          ./dist/tofu-overlay-linux-amd64 version
+          ./dist/tofu-overlay-linux-amd64 --help > /dev/null
+      - name: Checksums
+        run: cd dist && sha256sum *.whl *.tar.gz tofu-overlay-linux-amd64 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/tofu-overlay-linux-amd64
+            dist/SHA256SUMS
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/tofu-overlay-linux-amd64
+            dist/SHA256SUMS
+
+  pypi:
+    # Enable by setting the repository variable PYPI_PUBLISH=true after configuring
+    # a trusted publisher on PyPI (workflow release.yml, environment pypi).
+    if: vars.PYPI_PUBLISH == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: rm -f dist/tofu-overlay-linux-amd64 dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@release/v1

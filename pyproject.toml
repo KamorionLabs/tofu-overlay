@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
 dev = [
     "pytest>=8.0",
     "moto[s3,dynamodb]>=5.0",

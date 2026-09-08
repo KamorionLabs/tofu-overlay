@@ -61,6 +61,14 @@ The cloud has no branches: two overlays can run in parallel only when their
 cloud changes are disjoint at resource granularity. The registry enforces
 exactly that, nothing more.
 
+## Install
+
+- Linux CI agent (no Python needed): `curl -fsSL https://raw.githubusercontent.com/KamorionLabs/tofu-overlay/main/scripts/install.sh | sh -s -- 0.1.0`
+- With uv: `uv tool install git+https://github.com/KamorionLabs/tofu-overlay@v0.1.0` (or `uv tool install kmr-tofu-overlay` once published on PyPI)
+- With pipx: `pipx install kmr-tofu-overlay`
+
+Every release ships a wheel, an sdist, a `tofu-overlay-linux-amd64` binary and `SHA256SUMS`. See [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Quick start
 
 ```bash

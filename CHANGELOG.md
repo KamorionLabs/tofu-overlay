@@ -61,3 +61,4 @@ project adheres to [Semantic Versioning](https://semver.org/).
   verifies; empty optional import-id groups are dropped.
 - `-C` with a relative `--backend-config`, symlinked env dirs refused for
   mutating commands, `rebase` conflicts exit 3, plan files are pruned.
+- Release workflow: wheel, sdist, Linux binary, GitHub release, optional PyPI trusted publishing; `scripts/install.sh`.
