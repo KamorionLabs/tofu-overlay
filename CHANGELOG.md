@@ -9,8 +9,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Trunk drift detection (DESIGN §7.8): `OverlayService.trunk_baseline`
-  plans the trunk config (`git archive origin/<trunk>` exported under
-  `.tofu-overlay/_trunk/<sha>/`, new `trunk` module) against the base state
+  plans the trunk config (`origin/<trunk>` checked out detached in a
+  `git clone --shared` of the repository under `.tofu-overlay/_trunk/<sha>/`
+  — a real checkout with a `.git` directory and the same `origin` URL, so
+  modules reading git metadata plan; new `trunk` module) against the base state
   in `.tofu-overlay/_trunk-data/`, cached in `_base/trunk_baseline.json`
   keyed by (trunk sha, base ETag). `plan.evaluate` takes `trunk_drift`; base
   updates in the baseline are listed in `PolicyResult.drift`, not claimed,

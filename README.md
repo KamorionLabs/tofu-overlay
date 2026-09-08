@@ -197,8 +197,8 @@ sections 13 and 14):
 
 - **trunk drift**: the base state lags the trunk config (the trunk pipeline
   has not applied the latest trunk on that environment). `plan` computes a
-  trunk baseline (`git archive origin/<trunk>` planned against the base
-  state, cached under `.tofu-overlay/`) and lists those updates as `drift`
+  trunk baseline (a shared clone of `origin/<trunk>` planned against the
+  base state, cached under `.tofu-overlay/`) and lists those updates as `drift`
   without claiming them; `apply` refuses (exit 4) until the trunk pipeline
   runs and the overlay is rebased, or `--accept-drift` claims them;
 - **environment-dependent attributes** (`aws_lambda_function.filename`

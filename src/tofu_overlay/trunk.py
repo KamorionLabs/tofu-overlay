@@ -2,21 +2,22 @@
 
 The trunk baseline (DESIGN §7.8) plans the **trunk configuration** against the
 **base state** to learn which base resources would change under a trunk apply.
-The trunk tree comes from ``git archive <ref>`` extracted into a cache
-directory, never from a worktree: some modules probe for a real ``.git/HEAD``
-and a worktree would also register itself in the repository.
+The trunk tree is a **real repository checkout**: a ``git clone --shared`` of
+the local repository (objects shared through alternates, nothing copied) with
+``trunk_ref`` checked out detached. Neither ``git archive`` nor a worktree
+would do: common modules (default tags, git metadata) walk up to a
+``.git/HEAD`` inside a ``.git`` *directory* and read the remotes through a
+git provider; an archive has no ``.git`` and a worktree's ``.git`` is a file
+that also registers itself in the repository. The clone's ``origin`` URL is
+copied from the repository so a git provider sees the same remote as the
+real checkout.
 
-Git calls go through the injectable runners of :mod:`tofu_overlay.config`
-(text) and a local bytes runner for the archive stream.
+Every git call goes through the injectable runner of :mod:`tofu_overlay.config`.
 """
 
 from __future__ import annotations
 
-import io
 import shutil
-import subprocess
-import tarfile
-from collections.abc import Callable
 from pathlib import Path
 
 from tofu_overlay.config import Runner, _git
@@ -24,13 +25,6 @@ from tofu_overlay.models import ToolError
 
 EXPORT_MARKER = ".tofu-overlay-export"
 """File written at the root of a finished export, holding the commit sha."""
-
-BytesRunner = Callable[[list[str], Path], "subprocess.CompletedProcess[bytes]"]
-"""Signature of the bytes-capturing runner used for ``git archive``."""
-
-
-def _default_bytes_runner(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(argv, cwd=str(cwd), capture_output=True, check=False)
 
 
 def trunk_sha(repo_root: Path, trunk_ref: str, runner: Runner | None = None) -> str | None:
@@ -42,14 +36,20 @@ def trunk_sha(repo_root: Path, trunk_ref: str, runner: Runner | None = None) -> 
     return sha or None
 
 
-def _extract(archive: bytes, dest: Path) -> None:
-    """Extract a tar stream into ``dest`` keeping symlinks (``filter="tar"`` when available)."""
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
-        if hasattr(tarfile, "tar_filter"):
-            tar.extractall(dest, filter="tar")
-        else:  # pragma: no cover - Python < 3.11.4
-            tar.extractall(dest)
+def _origin_url(repo_root: Path, runner: Runner | None) -> str | None:
+    """URL of the ``origin`` remote of ``repo_root``, or ``None`` when there is none."""
+    proc = _git(["remote", "get-url", "origin"], repo_root, runner)
+    if proc.returncode != 0:
+        return None
+    url = proc.stdout.strip()
+    return url or None
+
+
+def _git_checked(args: list[str], cwd: Path, runner: Runner | None, what: str) -> None:
+    proc = _git(args, cwd, runner)
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        raise ToolError(f"{what} failed: {detail or proc.returncode}")
 
 
 def export_trunk_tree(
@@ -58,31 +58,46 @@ def export_trunk_tree(
     dest: Path,
     *,
     runner: Runner | None = None,
-    bytes_runner: BytesRunner | None = None,
 ) -> str:
-    """Export the tree of ``trunk_ref`` into ``dest`` (``git archive`` + tar extraction).
+    """Check out the tree of ``trunk_ref`` into ``dest`` as a shared clone of ``repo_root``.
 
-    Returns the commit sha of the ref. ``dest`` is created; an existing
-    directory is reused (files are overwritten, extra files are left alone).
-    Symlinks are preserved as symlinks. Submodules come out as empty
-    directories (``git archive`` semantics). ``ToolError`` when the ref is
-    unknown or the archive fails.
+    ``dest`` becomes (or already is) a repository: ``git clone --shared
+    --no-checkout`` of ``repo_root`` when ``dest/.git`` is not a directory
+    (an existing non-repository ``dest`` is replaced), with ``origin`` set to
+    the URL of ``repo_root``'s ``origin`` when there is one; then
+    ``git checkout --force --detach <sha>`` (``--force`` so that a run on a
+    half-written clone restores the tree). Objects are shared with
+    ``repo_root`` (alternates), so nothing is copied and no fetch is needed.
+    Symlinks are preserved by git; submodules are not initialised; untracked
+    files in an existing clone are left alone. Returns the commit sha.
+    ``ToolError`` when the ref is unknown or git fails.
     """
     sha = trunk_sha(repo_root, trunk_ref, runner)
     if sha is None:
         raise ToolError(f"git: {trunk_ref} is unknown locally (fetch the trunk first)")
-    run = bytes_runner or _default_bytes_runner
-    try:
-        proc = run(["git", "archive", "--format=tar", sha], repo_root)
-    except OSError as exc:
-        raise ToolError(f"cannot run git archive: {exc}") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
-        raise ToolError(f"git archive {trunk_ref} failed: {detail or proc.returncode}")
-    try:
-        _extract(proc.stdout or b"", dest)
-    except (tarfile.TarError, OSError) as exc:
-        raise ToolError(f"cannot extract the trunk archive into {dest}: {exc}") from exc
+    repo_root = Path(repo_root)
+    dest = Path(dest)
+    if not (dest / ".git").is_dir():
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _git_checked(
+            ["clone", "--shared", "--no-checkout", "--quiet", str(repo_root), str(dest)],
+            repo_root,
+            runner,
+            f"git clone of {repo_root}",
+        )
+        url = _origin_url(repo_root, runner)
+        if url is not None:
+            _git_checked(
+                ["remote", "set-url", "origin", url], dest, runner, "git remote set-url origin"
+            )
+    _git_checked(
+        ["checkout", "--quiet", "--force", "--detach", sha],
+        dest,
+        runner,
+        f"git checkout {trunk_ref} ({sha[:12]})",
+    )
     return sha
 
 
@@ -117,12 +132,13 @@ def ensure_trunk_export(
     cache_root: Path,
     *,
     runner: Runner | None = None,
-    bytes_runner: BytesRunner | None = None,
 ) -> tuple[Path, str]:
     """Export ``trunk_ref`` under ``cache_root/<sha>/`` once per sha; keep only that sha.
 
-    A finished export carries an :data:`EXPORT_MARKER` file; a directory
-    without it (interrupted export) is rebuilt. Returns ``(export_dir, sha)``.
+    A finished export is a clone carrying an :data:`EXPORT_MARKER` file. A
+    directory without the marker (interrupted export) is rebuilt: the
+    checkout runs again on the existing clone, or the directory is cloned
+    afresh when it holds no ``.git`` directory. Returns ``(export_dir, sha)``.
     """
     sha = trunk_sha(repo_root, trunk_ref, runner)
     if sha is None:
@@ -130,12 +146,10 @@ def ensure_trunk_export(
     cache_root = Path(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
     final = cache_root / sha
-    if (final / EXPORT_MARKER).is_file():
+    if (final / EXPORT_MARKER).is_file() and (final / ".git").is_dir():
         _prune(cache_root, sha)
         return final, sha
-    if final.exists():
-        shutil.rmtree(final, ignore_errors=True)
-    export_trunk_tree(repo_root, trunk_ref, final, runner=runner, bytes_runner=bytes_runner)
+    export_trunk_tree(repo_root, trunk_ref, final, runner=runner)
     (final / EXPORT_MARKER).write_text(sha + "\n", encoding="utf-8")
     _prune(cache_root, sha)
     return final, sha

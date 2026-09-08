@@ -714,9 +714,10 @@ class OverlayService:
     def trunk_baseline(self, refresh: bool = False) -> dict[str, list[str]] | None:
         """``address -> actions`` of a plan of the trunk config against the base state.
 
-        The trunk tree is ``git archive origin/<trunk>`` exported under
-        :attr:`trunk_cache_dir` and planned from the same relative env dir in
-        :attr:`trunk_data_dir` (base key, ``-refresh`` on, read-only). The
+        The trunk tree is a shared clone of the repository with
+        ``origin/<trunk>`` checked out under :attr:`trunk_cache_dir`, planned
+        from the same relative env dir in :attr:`trunk_data_dir` (base key,
+        ``-refresh`` on, read-only). The
         result is cached in the base data dir keyed by (trunk sha, base ETag)
         and recomputed when either changed or on ``refresh``. Returns ``None``
         with a warning when ``origin/<trunk>`` is unknown locally, the export

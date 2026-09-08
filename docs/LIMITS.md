@@ -230,9 +230,9 @@ Claiming and applying them from the overlay would silently do the trunk's
 work under the branch's name, and the registry would then block the trunk
 (`guard`) or another branch on those addresses.
 
-The tool computes a **trunk baseline**: `git archive origin/<trunk>` exported
-under `.tofu-overlay/_trunk/<sha>/` (never a worktree) and planned from the
-same relative env dir against the base state (`.tofu-overlay/_trunk-data/`,
+The tool computes a **trunk baseline**: `origin/<trunk>` checked out detached
+in a `git clone --shared` of the repository under `.tofu-overlay/_trunk/<sha>/`
+(objects shared, nothing copied) and planned from the same relative env dir against the base state (`.tofu-overlay/_trunk-data/`,
 read-only, cached per trunk sha and base ETag). A base `update` that the
 baseline also reports is classified as **drift**: not claimed, listed by
 `plan` (`drift:` lines, `drift` in `--json`), warned by `check`, and `apply`
@@ -252,8 +252,14 @@ Caveats:
   (`TF_VAR_tofu_overlay_*`), like the trunk pipeline would. A trunk config
   that cannot plan locally (missing `--backend-config`, provider auth) makes
   `plan` fail; `--accept-drift` degrades that failure to a warning;
-- `git archive` does not export submodules nor files marked
-  `export-ignore`;
+- the export is a real repository (a `.git` directory, `origin` set to the
+  same URL as the checkout) because common modules walk up to `.git/HEAD`
+  and read the remotes through a git provider; `git archive` (no `.git`)
+  and worktrees (`.git` is a file) both break them. Submodules are not
+  initialised in the export; the clone shares the repository's objects
+  (`objects/info/alternates`), so pruning objects of the repository while
+  a cached export references them invalidates that export (the next run
+  rebuilds it);
 - a branch that changes a resource the trunk also changed is classified as
   drift for that resource: `--accept-drift` is the way to claim it;
 - `delete`/replace of base resources stay denied whatever the baseline says

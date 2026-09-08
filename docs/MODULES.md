@@ -60,11 +60,11 @@ Trunk baseline helpers (DESIGN §7.8). Depends on `config` (git runner) and `mod
 ```python
 EXPORT_MARKER = ".tofu-overlay-export"                      # written at the root of a finished export, holds the sha
 def trunk_sha(repo_root: Path, trunk_ref: str, runner: Runner|None = None) -> str | None   # `git rev-parse --verify <ref>^{commit}`; None when unknown locally
-def export_trunk_tree(repo_root: Path, trunk_ref: str, dest: Path, *, runner=None, bytes_runner=None) -> str
-    # `git archive --format=tar <sha>` extracted into dest with tarfile (symlinks kept, never a worktree: some modules probe .git/HEAD); returns the sha; ToolError on unknown ref / archive failure
+def export_trunk_tree(repo_root: Path, trunk_ref: str, dest: Path, *, runner=None) -> str
+    # real checkout: `git clone --shared --no-checkout <repo_root> <dest>` when dest/.git is not a directory (origin URL copied from repo_root), then `git checkout --force --detach <sha>`; symlinks kept, submodules not initialised; never `git archive` (no .git) nor a worktree (.git is a file): modules probe .git/HEAD and read remotes; returns the sha; ToolError on unknown ref / git failure
 def trunk_env_dir(dest: Path, repo_root: Path, cwd: Path) -> Path   # dest / (cwd relative to repo_root); tolerant to one side being resolved; ToolError when cwd is outside
-def ensure_trunk_export(repo_root: Path, trunk_ref: str, cache_root: Path, *, runner=None, bytes_runner=None) -> tuple[Path, str]
-    # export once per sha under cache_root/<sha>/ (EXPORT_MARKER marks a finished export, an interrupted one is rebuilt), remove every other sha; returns (export_dir, sha)
+def ensure_trunk_export(repo_root: Path, trunk_ref: str, cache_root: Path, *, runner=None) -> tuple[Path, str]
+    # export once per sha under cache_root/<sha>/ (EXPORT_MARKER + .git dir mark a finished export; without the marker the checkout is rerun on the clone, without .git it is re-cloned), remove every other sha; returns (export_dir, sha)
 ```
 
 ## backend.py
