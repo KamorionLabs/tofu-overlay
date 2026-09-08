@@ -9,6 +9,7 @@ Status: **v1 (alpha)**. Target: OpenTofu >= 1.7 with the `s3` backend
 Full design: [docs/DESIGN.md](docs/DESIGN.md). Hard limits:
 [docs/LIMITS.md](docs/LIMITS.md). CI wiring: [docs/CI.md](docs/CI.md).
 Multi-stack branches: [docs/MULTI-STACK.md](docs/MULTI-STACK.md).
+Deferred work and other backends: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## The problem: one sandbox, many branches
 
@@ -154,7 +155,8 @@ The backend is resolved in this order; the first complete answer wins:
 3. the cached backend in `.terraform/terraform.tfstate`;
 4. the `backend "s3" {}` block in the directory's `*.tf` files.
 
-Unresolved values (`${...}`), an `azurerm` backend or a non-default workspace
+Unresolved values (`${...}`), a backend other than `s3` (`backend 'azurerm'
+is not supported yet, see docs/ROADMAP.md`) or a non-default workspace
 (`TF_WORKSPACE`, `.terraform/environment`) are refused with a clear message.
 `--print-backend` prints the resolved tuple and exits.
 
@@ -266,14 +268,17 @@ Implemented in v1:
   ([docs/MULTI-STACK.md](docs/MULTI-STACK.md));
 - CI mode (generic and Azure DevOps).
 
-Deferred, documented in [docs/LIMITS.md](docs/LIMITS.md) and
-[docs/SYNC-PROPOSAL.md](docs/SYNC-PROPOSAL.md):
+Deferred, tracked in [docs/ROADMAP.md](docs/ROADMAP.md) (details in
+[docs/LIMITS.md](docs/LIMITS.md) and [docs/SYNC-PROPOSAL.md](docs/SYNC-PROPOSAL.md)):
 
+- other backends (`azurerm`, `gcs`, `http`, `local`): the store layer is
+  backend-agnostic (`store.StateStore`, `store.make_store`), only `s3` is
+  implemented;
 - `merge --strategy state` (direct state injection);
 - `--destructive exclusive` (replacement of base resources by a single overlay);
 - stacked overlays (`create --base-overlay`);
 - `registry repair`, DynamoDB registry backend, identity-based imports,
-  non-default workspaces, state encryption surgery, `azurerm` backend.
+  non-default workspaces, state encryption surgery.
 
 ## Development
 

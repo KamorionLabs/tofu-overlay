@@ -322,7 +322,7 @@ class TestImportStrategyLifecycle:
         assert ov.status == Status.ACTIVE
         assert ov.branch == BRANCH
         assert ov.base_etag
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         forked = json.loads(
             s3_client.get_object(Bucket=BUCKET, Key=service.overlay_key)["Body"].read()
         )
@@ -373,8 +373,8 @@ class TestImportStrategyLifecycle:
 
         _adopt_in_base(s3_client, service.overlay_key, NEW_ADDRESS)
         service.finalize(purge=False, yes=True)
-        assert not service.s3.exists(service.overlay_key)
-        archives = [k for k in service.s3.list_prefix(f"{BASE_KEY}@") if ".merged-" in k]
+        assert not service.store.exists(service.overlay_key)
+        archives = [k for k in service.store.list_prefix(f"{BASE_KEY}@") if ".merged-" in k]
         assert len(archives) == 1
         doc, _ = service.registry.load()
         assert name not in doc.overlays
@@ -497,7 +497,7 @@ class TestRebase:
         _move_base(s3_client, base_in_s3)
         ov = service.rebase(yes=True)
         assert ov.status == Status.ACTIVE
-        archives = [k for k in service.s3.list_prefix(f"{BASE_KEY}@") if ".rebase-" in k]
+        archives = [k for k in service.store.list_prefix(f"{BASE_KEY}@") if ".rebase-" in k]
         assert len(archives) == 1
         rebased = json.loads(
             s3_client.get_object(Bucket=BUCKET, Key=service.overlay_key)["Body"].read()
@@ -514,7 +514,7 @@ class TestRebase:
             service.rebase(yes=True)
         assert exc.value.exit_code == ExitCode.POLICY
         assert NEW_ADDRESS in str(exc.value)
-        assert not any(".rebase-" in k for k in service.s3.list_prefix(f"{BASE_KEY}@"))
+        assert not any(".rebase-" in k for k in service.store.list_prefix(f"{BASE_KEY}@"))
 
 
 class TestAbandon:
@@ -523,11 +523,11 @@ class TestAbandon:
         _merged(service)
         with pytest.raises(FrozenError):
             service.abandon(keep_resources=False, dry_run=False, yes=True)
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         FakeRunner.calls.clear()
         service.abandon(keep_resources=True, dry_run=False, yes=True)
         assert not [c for c in FakeRunner.calls if c[0] == "apply"]
-        assert not service.s3.exists(service.overlay_key)
+        assert not service.store.exists(service.overlay_key)
         doc, _ = service.registry.load()
         assert doc.tombstones[service.name].status == Status.ABANDONED
 
@@ -536,7 +536,7 @@ class TestAbandon:
         _adopt_in_base(s3_client, service.overlay_key, NEW_ADDRESS)
         with pytest.raises(PolicyError, match="already merged"):
             service.abandon(keep_resources=False, dry_run=False, yes=True)
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         assert _status_of(service) == Status.ACTIVE
 
     def test_abandon_destroy_plan_touching_base_is_refused(self, service, monkeypatch):
@@ -563,7 +563,7 @@ class TestAbandon:
         with pytest.raises(PolicyError, match="non-owned"):
             service.abandon(keep_resources=False, dry_run=False, yes=True)
         assert not [c for c in FakeRunner.calls if c[0] == "apply"]
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         assert _status_of(service) == Status.ACTIVE
 
     def test_abandon_typed_confirmation_mismatch_aborts(self, service, console):
@@ -573,7 +573,7 @@ class TestAbandon:
         with pytest.raises(ToolError, match="abandon aborted"):
             service.abandon(keep_resources=False, dry_run=False, yes=False)
         assert not [c for c in FakeRunner.calls if c[0] == "apply"]
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         assert _status_of(service) == Status.ACTIVE
 
     def test_abandon_keeps_pending_revert_for_update_claims(self, service, make_claim):
@@ -601,14 +601,14 @@ class TestAbandon:
         service.create()
         service.apply(auto_approve=True, allow_stale=False, allow_behind=False)
         service.abandon(keep_resources=False, dry_run=True, yes=True)
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
 
         FakeRunner.calls.clear()
         service.abandon(keep_resources=False, dry_run=False, yes=True)
         destroyed = [c for c in FakeRunner.calls if c[0] == "apply"]
         assert destroyed == [["apply", service.overlay_key]]
-        assert not service.s3.exists(service.overlay_key)
-        assert any(".abandoned-" in k for k in service.s3.list_prefix(f"{BASE_KEY}@"))
+        assert not service.store.exists(service.overlay_key)
+        assert any(".abandoned-" in k for k in service.store.list_prefix(f"{BASE_KEY}@"))
         base = json.loads(s3_client.get_object(Bucket=BUCKET, Key=BASE_KEY)["Body"].read())
         assert statemod.addresses(base) == statemod.addresses(base_in_s3)
         doc, _ = service.registry.load()
@@ -629,7 +629,7 @@ class TestFinalize:
         _adopt_in_base(s3_client, service.overlay_key, NEW_ADDRESS, {"id": "trunk-made-its-own"})
         with pytest.raises(PolicyError, match="created its own objects"):
             service.finalize(purge=False, yes=True)
-        assert service.s3.exists(service.overlay_key)
+        assert service.store.exists(service.overlay_key)
         assert _status_of(service) == Status.MERGING
 
     def test_finalize_accepts_recreated_address_absent_from_imports_file(
@@ -659,9 +659,9 @@ class TestFinalize:
         _merged(service)
         _adopt_in_base(s3_client, service.overlay_key, NEW_ADDRESS)
         service.finalize(purge=True, yes=True)
-        assert not service.s3.exists(service.overlay_key)
-        assert service.s3.exists(BASE_KEY)
-        assert not any(".merged-" in k for k in service.s3.list_prefix(f"{BASE_KEY}@"))
+        assert not service.store.exists(service.overlay_key)
+        assert service.store.exists(BASE_KEY)
+        assert not any(".merged-" in k for k in service.store.list_prefix(f"{BASE_KEY}@"))
 
 
 class TestMerge:

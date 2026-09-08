@@ -1,10 +1,12 @@
-"""Raw S3 and DynamoDB access for the ``s3`` backend.
+"""Raw S3 and DynamoDB access for the ``s3`` backend (the ``StateStore`` implementation).
 
 State objects are only ever *read* here (``HEAD``, ``ListObjects``) or moved
 around (``CopyObject`` to an archive key, ``DeleteObject`` at finalize/abandon);
 every state write goes through tofu (see DESIGN §3). The registry document is a
 plain JSON object written with S3 conditional requests (``IfMatch`` /
-``IfNoneMatch: *``) so concurrent writers never clobber each other.
+``IfNoneMatch: *``) so concurrent writers never clobber each other. The digest
+and lock methods of the contract map to the DynamoDB ``-md5`` item, the
+DynamoDB lock item and the ``.tflock`` object of ``use_lockfile``.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from tofu_overlay.models import BackendConfig, RegistryError, ToolError
+from tofu_overlay.store import CasConflict
 
 __all__ = ["S3State", "CasConflict"]
 
@@ -25,10 +28,6 @@ LOCKFILE_SUFFIX = ".tflock"
 NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 CAS_CODES = frozenset({"PreconditionFailed", "ConditionalRequestConflict", "412", "409"})
 _RETRY_CONFIG = Config(retries={"mode": "standard", "max_attempts": 5})
-
-
-class CasConflict(RegistryError):
-    """A conditional S3 write lost the race (HTTP 412 or 409)."""
 
 
 def _error_code(exc: ClientError) -> str:
@@ -58,9 +57,11 @@ def _message(exc: ClientError) -> str:
 class S3State:
     """Thin wrapper over the S3 bucket and DynamoDB lock table of a backend.
 
-    Pass a preconfigured ``boto3.Session`` for tests (moto) or to reuse
-    credentials; otherwise one is built from ``cfg.profile`` / ``cfg.region``.
-    Clients are created lazily so constructing the object never hits the network.
+    Implements :class:`tofu_overlay.store.StateStore`; build it through
+    :func:`tofu_overlay.store.make_store`. Pass a preconfigured ``boto3.Session``
+    for tests (moto) or to reuse credentials; otherwise one is built from
+    ``cfg.profile`` / ``cfg.region``. Clients are created lazily so constructing
+    the object never hits the network.
     """
 
     def __init__(self, cfg: BackendConfig, session: boto3.Session | None = None) -> None:
@@ -243,19 +244,19 @@ class S3State:
                 f"DynamoDB DeleteItem {self.cfg.dynamodb_table}/{lock_id} failed: {_message(exc)}"
             ) from exc
 
-    def md5_item_exists(self, path: str) -> bool:
+    def digest_item_exists(self, path: str) -> bool:
         """True when the ``<bucket>/<path>-md5`` digest item exists (False without a table)."""
         if not self.cfg.dynamodb_table:
             return False
         return self._get_item(self.cfg.md5_lock_id(path)) is not None
 
-    def delete_md5_item(self, path: str) -> None:
+    def delete_digest_item(self, path: str) -> None:
         """Delete the ``<bucket>/<path>-md5`` digest item (no-op without a table)."""
         if not self.cfg.dynamodb_table:
             return
         self._delete_item(self.cfg.md5_lock_id(path))
 
-    def lock_item(self, path: str) -> dict | None:
+    def lock_info(self, path: str) -> dict | None:
         """Current tofu lock info for ``LockID=<bucket>/<path>``, or ``None`` when unlocked."""
         if not self.cfg.dynamodb_table:
             return None
@@ -273,7 +274,7 @@ class S3State:
 
     # --------------------------------------------------------------- lockfile
 
-    def delete_lockfile(self, path: str) -> None:
+    def delete_lock_marker(self, path: str) -> None:
         """Delete the S3 ``<path>.tflock`` object left by ``use_lockfile`` if present."""
         key = f"{path}{LOCKFILE_SUFFIX}"
         if self.exists(key):

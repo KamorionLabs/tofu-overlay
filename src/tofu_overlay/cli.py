@@ -29,7 +29,7 @@ from tofu_overlay.models import (
 from tofu_overlay.output import Console
 from tofu_overlay.overlay import OverlayService
 from tofu_overlay.registry import Registry
-from tofu_overlay.s3state import S3State
+from tofu_overlay.store import make_store
 from tofu_overlay.tofu import validate_passthrough
 
 app = typer.Typer(
@@ -439,12 +439,12 @@ def _list_prefix(g: Globals, prefix: str) -> int:
         dynamodb_table=g.overrides.get("dynamodb_table"),
         kms_key_id=None,
     )
-    s3 = S3State(cfg, session=g.session)
+    store = make_store(cfg, session=g.session)
     rows = []
-    for key in sorted(s3.list_prefix(prefix)):
+    for key in sorted(store.list_prefix(prefix)):
         if not key.endswith(".overlays.json"):
             continue
-        loaded = s3.get_json(key)
+        loaded = store.get_json(key)
         if loaded is None:
             continue
         doc = RegistryDoc.model_validate(loaded[0])
@@ -462,7 +462,8 @@ def _list_prefix(g: Globals, prefix: str) -> int:
     else:
         columns = ["base_key", "name", "branch", "status", "claims"]
         console.table(
-            f"s3://{bucket}/{prefix}", columns, [[str(r[c]) for c in columns] for r in rows]
+            f"{cfg.backend_type}://{bucket}/{prefix}", columns,
+            [[str(r[c]) for c in columns] for r in rows]
         )
     return 0
 
@@ -609,8 +610,8 @@ def guard(
 
     def body() -> int:
         setup = _setup(ctx, mutating=False)
-        s3 = S3State(setup.backend, session=setup.g.session)
-        registry = Registry(s3, setup.backend, __version__)
+        store = make_store(setup.backend, session=setup.g.session)
+        registry = Registry(store, setup.backend, __version__)
         violations = guard_plan(
             plan_json, registry=registry, knowledge=TypeKnowledge.load(setup.cfg)
         )

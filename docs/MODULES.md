@@ -1,6 +1,6 @@
 # Module contracts (v1)
 
-Every module implements exactly these public names with these signatures. Implementers may add private helpers. Types come from `tofu_overlay.models`. No module may import from `overlay.py`, `merge.py` or `cli.py` (those are the top of the dependency graph). Dependency order: `models` → `config`, `identity`, `state` → `backend`, `s3state`, `tofu`, `plan` → `registry` → `overlay`, `merge` → `cli`. `output` depends only on `models`.
+Every module implements exactly these public names with these signatures. Implementers may add private helpers. Types come from `tofu_overlay.models`. No module may import from `overlay.py`, `merge.py` or `cli.py` (those are the top of the dependency graph). Dependency order: `models` → `config`, `identity`, `state` → `store`, `backend`, `s3state`, `tofu`, `plan` → `registry` → `overlay`, `merge` → `cli`. `output` depends only on `models`. `store` depends only on `models` (it imports `s3state` lazily inside `make_store`); `backend` imports the error text from `store`. Nothing above `store` may import `s3state`: the registry, the orchestration and the CLI are typed against `store.StateStore` and obtain an implementation through `store.make_store`.
 
 Conventions: Python 3.11, type hints everywhere, `from __future__ import annotations`, docstrings on public names, no `print` outside `output.py`, errors are subclasses of `models.OverlayError` carrying an `exit_code`. Comments in English. Keep functions small and testable; anything touching subprocess/boto3 must be injectable for tests.
 
@@ -11,8 +11,9 @@ class ExitCode(IntEnum): OK=0; ERROR=1; CHANGES=2; POLICY=3; STALE=4; REGISTRY=5
 class OverlayError(Exception): exit_code: ExitCode = ExitCode.ERROR   # subclasses: PolicyError(3), StaleError(4), RegistryError(5), NotAllowedError(6), FrozenError(7), ToolError(1)
 class Status(StrEnum): CREATING, ACTIVE, APPLYING, DIRTY, MERGING, MERGED, ABANDONED, NEEDS_REVIEW
 class ClaimKind(StrEnum): CREATE, UPDATE
-class BackendConfig(BaseModel): bucket:str; key:str; region:str|None; profile:str|None; dynamodb_table:str|None; use_lockfile:bool=False; encrypt:bool=True; kms_key_id:str|None; workspace:str="default"; backend_config_files:list[str]=[]
-    # helpers: state_path() -> str (== key for default ws); overlay_key(name)->str; registry_key()->str; archive_key(name, status, ts)->str; lock_id(path)->str ("<bucket>/<path>"); md5_lock_id(path)->str ("<bucket>/<path>-md5")
+class BackendConfig(BaseModel): backend_type:str="s3"; bucket:str; key:str; region:str|None; profile:str|None; dynamodb_table:str|None; use_lockfile:bool=False; encrypt:bool=True; kms_key_id:str|None; workspace:str="default"; backend_config_files:list[str]=[]
+    # backend_type names the tofu backend; the other attributes are the s3 ones (see docs/ROADMAP.md for the split a second backend needs)
+    # key builders (the ONLY place derived keys are built; a future backend may need its own layout): state_path() -> str (== key for default ws); overlay_prefix()->str ("<stem>@"); overlay_key(name)->str; registry_key()->str; archive_key(name, status, ts)->str; is_archive_key(key)->bool; lock_id(path)->str ("<bucket>/<path>"); md5_lock_id(path)->str ("<bucket>/<path>-md5")
     # extension-aware: "a/b/terraform.tfstate" -> overlay "a/b/terraform@NAME.tfstate", registry "a/b/terraform.overlays.json", archive "a/b/terraform@NAME.merged-TS.tfstate"
 class Claim(BaseModel): kind:ClaimKind; type:str; identity:dict[str,Any]={}; id:str|None; import_id:str|None; after_hash:str|None; dependencies:list[str]=[]; claimed_at:str; updated_at:str   # dependencies: state `dependencies` of a created instance, recorded at apply (guard)
 class Overlay(BaseModel): name; state_key; lineage:str|None; branch; owners:list[str]; caller_arn:str|None; binary:str="tofu"; tofu_version:str|None; created_at; updated_at; base_serial:int|None; base_etag:str|None; trunk_commit:str|None; status:Status; applied_commit:str|None; run_id:str|None; applying_since:str|None; claims:dict[str,Claim]={}; pending_revert:list[str]=[]; last_apply:dict|None
@@ -56,42 +57,68 @@ def ensure_gitignored(repo_root: Path, entry: str) -> bool        # True if `.to
 
 ```python
 class BackendResolutionError(ToolError)
-def parse_hcl_backend(dir: Path) -> dict | None            # scan *.tf (not symlink-following issues: follow symlinks fine) for terraform{backend "s3"{}}; python-hcl2 8.x returns quoted strings ("\"x\"") -> strip quotes; return raw dict of attrs; azurerm/other backend -> error naming it
+def parse_hcl_backend(dir: Path) -> dict | None            # scan *.tf (symlinks followed) for terraform{backend "<type>"{}}; python-hcl2 8.x returns quoted strings ("\"x\"") -> strip quotes; return raw dict of attrs plus "backend_type": <type> (any type; several blocks -> error)
 def parse_remote_state_refs(dir: Path) -> list[RemoteStateRef]   # every data "terraform_remote_state" with backend = "s3" in *.tf (symlinks followed); config.bucket/key/region unquoted; key literal or the `lookup(var.tofu_overlay_keys, "<key>", ...)` contract -> resolved; any other expression (or a bucket expression, or a non-default workspace) -> unresolved=True, key None; other backends skipped
 def parse_backend_config_files(files: list[Path]) -> dict    # key=value and HCL files (tofu -backend-config syntax)
-def read_cached_backend(data_dir: Path) -> dict | None      # <data_dir>/terraform.tfstate JSON: {"backend": {"type": "s3", "config": {...}}}
+def read_cached_backend(data_dir: Path) -> dict | None      # <data_dir>/terraform.tfstate JSON: {"backend": {"type": ..., "config": {...}}} -> config plus "backend_type" (any type)
 def resolve_backend(cwd: Path, *, overrides: dict, backend_config_files: list[Path], data_dir: Path|None) -> BackendConfig
-    # precedence: overrides > files > cached > HCL; error if bucket/key missing or contain "${"; error if workspace != default (TF_WORKSPACE env or <cwd>/.terraform/environment)
-def describe(cfg: BackendConfig) -> str                     # "s3://bucket/key (region, profile, table, lockfile)"
+    # precedence: overrides > files > cached > HCL; backend_type from the merged layers (default "s3") must be in store.SUPPORTED_BACKENDS else BackendResolutionError(store.unsupported_backend_message(type)) = "backend '<type>' is not supported yet, see docs/ROADMAP.md (...)"; error if bucket/key missing or contain "${"; error if workspace != default (TF_WORKSPACE env or <cwd>/.terraform/environment)
+def describe(cfg: BackendConfig) -> str                     # "<backend_type>://bucket/key (region, profile, table, lockfile)"
+```
+
+## store.py
+
+```python
+SUPPORTED_BACKENDS: tuple[str, ...] = ("s3",)
+class CasConflict(RegistryError)                            # a conditional registry write lost the race (re-exported by s3state for compatibility)
+def unsupported_backend_message(backend_type: str) -> str  # "backend '<type>' is not supported yet, see docs/ROADMAP.md" + per-type hint (azurerm: leases, gcs: generations, http, local)
+@runtime_checkable
+class StateStore(Protocol):                                 # exactly the operations the tool needs from a backend; see docs/ROADMAP.md for the per-backend mapping
+    cfg: BackendConfig
+    def head(self, key: str) -> dict | None                 # {"etag": str, "size": int, "last_modified": str} or None when absent
+    def exists(self, key: str) -> bool
+    def list_prefix(self, prefix: str) -> list[str]
+    def copy(self, src: str, dst: str) -> None
+    def delete(self, key: str) -> None                      # absent object is not an error
+    def get_json(self, key: str) -> tuple[dict, str] | None # (doc, version token) or None when absent
+    def put_json(self, key: str, doc: dict, *, if_match: str | None, if_none_match: bool=False) -> str   # CAS write; CasConflict when the token no longer matches / object already exists
+    def digest_item_exists(self, path: str) -> bool         # backend checksum bookkeeping of a state key (no-op False when the backend has none)
+    def delete_digest_item(self, path: str) -> None
+    def lock_info(self, path: str) -> dict | None           # current tofu lock info, None when unlocked
+    def delete_lock_marker(self, path: str) -> None         # leftover lock marker of a state key, no-op when absent
+def make_store(cfg: BackendConfig, session: Any = None) -> StateStore   # "s3" -> s3state.S3State(cfg, session=session); other backend_type -> ToolError(unsupported_backend_message(type))
 ```
 
 ## s3state.py
 
+The `s3` implementation of `store.StateStore`; nothing above `store` imports it.
+
 ```python
-class S3State:
+class S3State:                                              # implements StateStore
     def __init__(self, cfg: BackendConfig, session: boto3.Session | None = None)
-    def head(self, key: str) -> dict | None                 # {"etag": str, "size": int, "last_modified": str} or None if 404
+    def head(self, key: str) -> dict | None                 # HEAD: {"etag": str, "size": int, "last_modified": str} or None if 404
     def exists(self, key: str) -> bool
-    def list_prefix(self, prefix: str) -> list[str]
+    def list_prefix(self, prefix: str) -> list[str]         # ListObjectsV2, paginated
     def copy(self, src: str, dst: str) -> None              # CopyObject, re-applies SSE (AES256 or aws:kms + kms_key_id) per cfg
     def delete(self, key: str) -> None
     def get_json(self, key: str) -> tuple[dict, str] | None # (doc, etag) or None if 404
-    def put_json(self, key: str, doc: dict, *, if_match: str | None, if_none_match: bool=False) -> str   # returns new etag; raises CasConflict(RegistryError) on 412/409 (PreconditionFailed, ConditionalRequestConflict)
-    # DynamoDB (only when cfg.dynamodb_table):
-    def md5_item_exists(self, path: str) -> bool
-    def delete_md5_item(self, path: str) -> None
-    def lock_item(self, path: str) -> dict | None           # current tofu lock info for LockID=bucket/path, or None
-    def delete_lockfile(self, path: str) -> None            # S3 <path>.tflock if present
-class CasConflict(RegistryError)
+    def put_json(self, key: str, doc: dict, *, if_match: str | None, if_none_match: bool=False) -> str   # IfMatch / IfNoneMatch: *; returns new etag; raises CasConflict on 412/409 (PreconditionFailed, ConditionalRequestConflict)
+    # DynamoDB (only when cfg.dynamodb_table; False/None/no-op otherwise):
+    def digest_item_exists(self, path: str) -> bool         # LockID=<bucket>/<path>-md5 item
+    def delete_digest_item(self, path: str) -> None
+    def lock_info(self, path: str) -> dict | None           # current tofu lock info for LockID=<bucket>/<path>, or None
+    def delete_lock_marker(self, path: str) -> None         # S3 <path>.tflock (use_lockfile) if present
+CasConflict = store.CasConflict                             # re-export
 ```
 
 ## registry.py
 
 ```python
 class Registry:
-    def __init__(self, s3: S3State, cfg: BackendConfig, tool_version: str)
+    def __init__(self, store: StateStore, cfg: BackendConfig, tool_version: str)
+    store: StateStore
     key: str                                                # cfg.registry_key()
-    def load(self) -> tuple[RegistryDoc, str | None]        # (doc, etag); if object missing: if any overlay objects exist under cfg.overlay_key("") prefix -> RegistryError("registry missing but overlays exist, run doctor"); else empty doc with etag None. Invalid JSON/newer version -> RegistryError
+    def load(self) -> tuple[RegistryDoc, str | None]        # (doc, etag); if object missing: if any overlay objects exist under cfg.overlay_prefix() -> RegistryError("registry missing but overlays exist, run doctor"); else empty doc with etag None. Invalid JSON/newer version -> RegistryError
     def update(self, fn: Callable[[RegistryDoc], None], *, attempts: int = 8) -> RegistryDoc   # CAS loop as in DESIGN §5; fn must be idempotent; after exhaustion re-load and return if fn(doc) is a no-op (compare dumps)
     def get_overlay(self, doc: RegistryDoc, name: str) -> Overlay   # NotAllowedError(6) if absent
     def conflicts_for(self, doc: RegistryDoc, me: str, wanted: dict[str, Claim]) -> list[Violation]   # checks 3 and 4 of DESIGN §7 against every live overlay except `me`
@@ -192,7 +219,8 @@ class Console:
 ```python
 class OverlayService:
     def __init__(self, cwd: Path, cfg: ToolConfig, backend: BackendConfig, console: Console, *, name: str | None = None, session=None, runner_factory=None)
-    # properties: name, registry, s3, knowledge, data_dir (.tofu-overlay/<name>), base_data_dir (.tofu-overlay/_base), repo_root
+    # properties: name, registry, store (StateStore built by store.make_store(backend, session=session)), knowledge, data_dir (.tofu-overlay/<name>), base_data_dir (.tofu-overlay/_base), repo_root
+    # remote-state lookups on other bases build their store through make_store as well; archive detection uses backend.is_archive_key, prefix scans backend.overlay_prefix()
     def create(self, *, force_name: bool = False) -> Overlay
     def plan(self, *, extra: list[str] = [], allow_behind: bool = False, detailed_exitcode: bool = False) -> tuple[PolicyResult, PlanSummary, Path, bool]   # (policy, summary, planfile, stale)
     def apply(self, *, auto_approve: bool, allow_stale: bool, allow_behind: bool, extra: list[str] = [], yes: bool = False) -> Overlay   # console.confirm before acquire_claims unless auto_approve/yes; plan file unlinked afterwards
@@ -215,7 +243,7 @@ IMPORTS_FILENAME = "zz_overlay_{name}.imports.tf"
 def render_imports(ov: Overlay, *, base: BackendConfig, base_etag: str, commit: str, generated_at: str) -> str   # sorted by address; header comment; per block `# identity: k=v`
 def write_imports(env_dir: Path, name: str, content: str) -> Path   # refuse if env_dir is a symlink or target exists as symlink
 def read_imports_addresses(path: Path) -> dict[str, str]     # address -> id parsed back from the file (regex over import blocks)
-class MergeService:
+class MergeService:                                        # reaches the store only through svc.store / svc.registry (StateStore-typed)
     def __init__(self, svc: OverlayService)
     def merge(self, *, allow_import_updates: bool, accept_recreate: list[str], allow_unapplied: bool, yes: bool) -> Path
     def undo(self, *, yes: bool) -> None
@@ -225,4 +253,4 @@ def guard(plan_json_path: Path, *, registry: Registry, knowledge: TypeKnowledge)
 
 ## cli.py
 
-Typer app `tofu-overlay` with commands: create, plan, apply, status, list, check, rebase, merge, finalize, abandon, doctor, guard, gc, version. Global options: `-C/--chdir`, `--name`, `--backend-config` (repeatable), `--bucket/--key/--region/--profile/--dynamodb-table`, `--json`, `--no-color`, `--yes`, `--print-backend`, `-v/--verbose`. Every command: build Console, resolve backend, echo backend line (not in `--json`), enforce allowed_base_keys for mutating commands, map `OverlayError.exit_code` to the process exit code, unexpected exceptions → exit 1 with message. `plan` passes anything after `--` to tofu after `validate_passthrough`.
+Typer app `tofu-overlay` with commands: create, plan, apply, status, list, check, rebase, merge, finalize, abandon, doctor, guard, gc, version. Never imports `s3state`: `guard` and `list --prefix` obtain their store through `store.make_store(cfg, session=INJECT["session"])`. Global options: `-C/--chdir`, `--name`, `--backend-config` (repeatable), `--bucket/--key/--region/--profile/--dynamodb-table`, `--json`, `--no-color`, `--yes`, `--print-backend`, `-v/--verbose`. Every command: build Console, resolve backend, echo backend line (not in `--json`), enforce allowed_base_keys for mutating commands, map `OverlayError.exit_code` to the process exit code, unexpected exceptions → exit 1 with message. `plan` passes anything after `--` to tofu after `validate_passthrough`.

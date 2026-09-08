@@ -1,6 +1,6 @@
 # tofu-overlay — design (v1)
 
-Status: v1 spec, 2026-09-08, after a three-lens adversarial review of the v0 draft (Terraform semantics, concurrency/safety, operability). Target: OpenTofu >= 1.7 with the `s3` backend (DynamoDB lock and/or `use_lockfile`). Terraform >= 1.5 best effort. Workspaces other than `default`, the `azurerm` backend and state encryption surgery are out of scope for v1 (detected and refused).
+Status: v1 spec, 2026-09-08, after a three-lens adversarial review of the v0 draft (Terraform semantics, concurrency/safety, operability). Target: OpenTofu >= 1.7 with the `s3` backend (DynamoDB lock and/or `use_lockfile`). Terraform >= 1.5 best effort. Workspaces other than `default`, backends other than `s3` and state encryption surgery are out of scope for v1 (detected and refused). The store layer is backend-agnostic by construction; see [ROADMAP.md](ROADMAP.md) for what another backend needs.
 
 ## 1. Problem
 
@@ -22,7 +22,7 @@ The cloud has no branches: two overlays can run in parallel only when their clou
 
 ## 3. Invariants (the safety core)
 
-1. **State objects are only written by OpenTofu.** Every read of a state is `tofu state pull`, every write is `tofu state push` (or `apply`), run in a dedicated `TF_DATA_DIR` whose backend points at the target key. This keeps the DynamoDB `-md5` digest item, the lock protocol, `use_lockfile`, lineage/serial checks and state encryption consistent. The only raw S3 operations on state keys are `HEAD` (ETag, existence), `ListObjects` (doctor), `CopyObject` to an archive key and `DeleteObject` (+ `DeleteItem` of the `-md5` item and `.tflock`) at finalize/abandon.
+1. **State objects are only written by OpenTofu.** Every read of a state is `tofu state pull`, every write is `tofu state push` (or `apply`), run in a dedicated `TF_DATA_DIR` whose backend points at the target key. This keeps the DynamoDB `-md5` digest item, the lock protocol, `use_lockfile`, lineage/serial checks and state encryption consistent. The only raw store operations on state keys are `head` (ETag, existence), `list_prefix` (doctor), `copy` to an archive key and `delete` (+ the digest item and lock marker) at finalize/abandon; they are the `store.StateStore` contract, implemented for `s3` by `s3state.py` (S3 `HEAD`/`ListObjects`/`CopyObject`/`DeleteObject`, DynamoDB `DeleteItem`, `.tflock`).
 2. **The base state is never written by the tool** in v1. The trunk adopts overlay resources through `import {}` blocks applied by the trunk pipeline.
 3. **The registry stores intention, the overlay state stores reality.** Ids, import ids and identities are recomputed from the overlay state whenever they matter (status, check, merge, finalize, abandon). Registry values are a cache.
 4. **Claims live until `finalize` or `abandon`.** Statuses `creating`, `active`, `applying`, `dirty`, `merging` all count in conflict checks.
@@ -90,7 +90,7 @@ Statuses: `creating` → `active` ⇄ `applying` → `active` | `dirty`; `active
 
 ## 6. Commands and exit codes
 
-All commands run from the stack's env directory (`-C/--chdir` accepted). Backend resolution order: flags/env (`TOFU_OVERLAY_BUCKET`, `_KEY`, `_REGION`, `_PROFILE`, `_DYNAMODB_TABLE`) > `--backend-config FILE` (repeatable, same files the pipeline uses) > cached backend in `.terraform/terraform.tfstate` > HCL `backend "s3"` block in `*.tf`. Unresolved values, `azurerm`, non-default workspaces (`TF_WORKSPACE`, `.terraform/environment`) → error with a clear message. The resolved tuple is echoed first; `--print-backend` prints it and exits.
+All commands run from the stack's env directory (`-C/--chdir` accepted). Backend resolution order: flags/env (`TOFU_OVERLAY_BUCKET`, `_KEY`, `_REGION`, `_PROFILE`, `_DYNAMODB_TABLE`) > `--backend-config FILE` (repeatable, same files the pipeline uses) > cached backend in `.terraform/terraform.tfstate` > HCL `backend "<type>"` block in `*.tf`. The parsers report the backend type; resolution refuses any type without a store implementation (`backend 'azurerm' is not supported yet, see docs/ROADMAP.md`), unresolved values and non-default workspaces (`TF_WORKSPACE`, `.terraform/environment`) with a clear message. The resolved tuple is echoed first; `--print-backend` prints it and exits.
 
 | Command | Effect |
 |---|---|
@@ -168,9 +168,12 @@ virtual_attributes: {}
 
 ## 11. Deferred (documented, not implemented)
 
-- `merge --strategy state` (direct injection into the base under the tofu lock protocol), with lineage, provider address and schema-version checks. See LIMITS.md.
-- `--destructive exclusive` (single-overlay replacement of base resources).
-- Stacked overlays (`create --base-overlay`), see SYNC-PROPOSAL.md.
+Tracked in [ROADMAP.md](ROADMAP.md), the single list of deferred work:
+
+- other state backends (`azurerm`, `gcs`, `http`, `local`) on top of the `store.StateStore` contract;
+- `merge --strategy state` (direct injection into the base under the tofu lock protocol), with lineage, provider address and schema-version checks. See LIMITS.md;
+- `--destructive exclusive` (single-overlay replacement of base resources);
+- stacked overlays (`create --base-overlay`), see SYNC-PROPOSAL.md;
 - `registry repair`, DynamoDB registry backend, identity-based `import` blocks, non-default workspaces, state encryption surgery.
 
 ## 12. Repository layout
@@ -180,8 +183,9 @@ src/tofu_overlay/
   __init__.py     version
   cli.py          typer app, exit-code mapping
   config.py       .tofu-overlay.yaml, CI detection, overlay naming, git helpers
-  backend.py      backend resolution, key builders (overlay/registry/archive), workspace refusal
-  s3state.py      boto3 session, HEAD/list/copy/delete, registry JSON CAS, DynamoDB md5/lock items
+  backend.py      backend resolution (type reported, unsupported types refused), workspace refusal
+  store.py        StateStore protocol, CasConflict, make_store(cfg) factory on backend_type
+  s3state.py      s3 StateStore: boto3 session, HEAD/list/copy/delete, registry JSON CAS, DynamoDB digest/lock items
   registry.py     Registry document, update(fn), status machine, claims
   tofu.py         runner: init/plan/show/apply/state pull|push|rm, arg validation, streaming
   state.py        state document helpers: addresses, instances, inject/remove, lineage/serial, identity
@@ -193,5 +197,5 @@ src/tofu_overlay/
   models.py       pydantic models, enums, exit codes
   data/identity.yaml  data/import_ids.yaml
 tests/            pytest + moto; fixtures/ (plan/state JSON)
-docs/DESIGN.md LIMITS.md CI.md MULTI-STACK.md SYNC-PROPOSAL.md
+docs/DESIGN.md LIMITS.md CI.md MULTI-STACK.md SYNC-PROPOSAL.md ROADMAP.md
 ```

@@ -1,12 +1,15 @@
-"""Backend resolution for the ``s3`` backend.
+"""Backend resolution: HCL block, cached backend, ``-backend-config`` files, overrides.
 
 Resolution order (highest precedence first): explicit overrides (CLI flags),
 ``TOFU_OVERLAY_*`` environment variables, ``-backend-config`` files, the backend
 cached by ``init`` in ``<data_dir>/terraform.tfstate``, and finally the
-``terraform { backend "s3" {} }`` block found in the stack's ``*.tf`` files.
+``terraform { backend "<type>" {} }`` block found in the stack's ``*.tf`` files.
 
-Anything that is not an ``s3`` backend, any non-default workspace and any
-unresolved ``${...}`` value is refused with a :class:`BackendResolutionError`.
+The parsers report the backend type (``backend_type`` entry) without judging
+it; :func:`resolve_backend` refuses any type without a
+:class:`~tofu_overlay.store.StateStore` implementation (see docs/ROADMAP.md),
+any non-default workspace and any unresolved ``${...}`` value with a
+:class:`BackendResolutionError`.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 import hcl2
 
 from tofu_overlay.models import BackendConfig, RemoteStateRef, ToolError
+from tofu_overlay.store import SUPPORTED_BACKENDS, unsupported_backend_message
 
 __all__ = [
     "BackendResolutionError",
@@ -32,6 +36,7 @@ __all__ = [
 ]
 
 SUPPORTED_BACKEND = "s3"
+BACKEND_TYPE_KEY = "backend_type"
 BLOCK_MARKER = "__is_block__"
 REMOTE_STATE_TYPE = "terraform_remote_state"
 OVERLAY_KEYS_VAR = "tofu_overlay_keys"
@@ -52,7 +57,7 @@ _COMMENT_LINE = re.compile(r"^\s*(#|//)")
 
 
 class BackendResolutionError(ToolError):
-    """The backend could not be resolved to a usable ``s3`` configuration."""
+    """The backend could not be resolved to a usable, supported configuration."""
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +122,13 @@ def _parse_tf_file(path: Path) -> dict | None:
 
 
 def parse_hcl_backend(dir: Path) -> dict | None:  # noqa: A002 - name fixed by contract
-    """Find the ``terraform { backend "s3" {} }`` block in ``dir``'s ``*.tf`` files.
+    """Find the ``terraform { backend "<type>" {} }`` block in ``dir``'s ``*.tf`` files.
 
     Returns the backend attributes as a plain dict (quotes and block markers
-    stripped, unresolved expressions kept verbatim as ``${...}``), or ``None``
-    when no backend block exists. A backend of another type is refused.
+    stripped, unresolved expressions kept verbatim as ``${...}``) plus a
+    ``backend_type`` entry naming the block's type, or ``None`` when no backend
+    block exists. Whether the type is supported is decided by
+    :func:`resolve_backend`, not here.
     """
     dir = Path(dir)
     if not dir.is_dir():
@@ -134,16 +141,11 @@ def parse_hcl_backend(dir: Path) -> dict | None:  # noqa: A002 - name fixed by c
         if not parsed:
             continue
         for backend_type, attrs in _backend_entries(parsed):
-            if backend_type != SUPPORTED_BACKEND:
-                raise BackendResolutionError(
-                    f"{tf.name} declares a {backend_type!r} backend; only "
-                    f"{SUPPORTED_BACKEND!r} is supported"
-                )
             if result is not None:
                 raise BackendResolutionError(
                     f"several backend blocks found (last one in {tf.name})"
                 )
-            result = attrs
+            result = {BACKEND_TYPE_KEY: backend_type, **attrs}
     return result
 
 
@@ -330,9 +332,9 @@ def parse_backend_config_files(files: list[Path]) -> dict:
 def read_cached_backend(data_dir: Path) -> dict | None:
     """Read the backend cached by ``init`` in ``<data_dir>/terraform.tfstate``.
 
-    Returns the ``backend.config`` dict without ``null`` entries, ``None`` when
-    the file is missing or unreadable. A cached backend of another type is
-    refused.
+    Returns the ``backend.config`` dict without ``null`` entries plus a
+    ``backend_type`` entry (when the cache names one), ``None`` when the file
+    is missing or unreadable.
     """
     path = Path(data_dir) / "terraform.tfstate"
     if not path.is_file():
@@ -344,15 +346,14 @@ def read_cached_backend(data_dir: Path) -> dict | None:
     backend = doc.get("backend") if isinstance(doc, dict) else None
     if not isinstance(backend, dict):
         return None
-    backend_type = backend.get("type")
-    if backend_type and backend_type != SUPPORTED_BACKEND:
-        raise BackendResolutionError(
-            f"{path} caches a {backend_type!r} backend; only {SUPPORTED_BACKEND!r} is supported"
-        )
     config = backend.get("config")
     if not isinstance(config, dict):
         return None
-    return {k: v for k, v in config.items() if v is not None}
+    result = {k: v for k, v in config.items() if v is not None}
+    backend_type = backend.get("type")
+    if isinstance(backend_type, str) and backend_type:
+        result[BACKEND_TYPE_KEY] = backend_type
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -418,12 +419,13 @@ def resolve_backend(
     backend_config_files: list[Path],
     data_dir: Path | None,
 ) -> BackendConfig:
-    """Resolve the ``s3`` backend of the stack in ``cwd``.
+    """Resolve the backend of the stack in ``cwd``.
 
     Precedence: ``overrides`` > ``TOFU_OVERLAY_*`` env > ``backend_config_files``
-    > cached backend in ``data_dir`` > HCL block. ``bucket`` and ``key`` are
-    mandatory; unresolved ``${...}`` values and non-default workspaces are
-    refused.
+    > cached backend in ``data_dir`` > HCL block. The backend type (from the
+    HCL block, the cache or a ``backend_type`` entry of a higher layer) must
+    have a store implementation; ``bucket`` and ``key`` are mandatory;
+    unresolved ``${...}`` values and non-default workspaces are refused.
     """
     cwd = Path(cwd)
     environ = dict(os.environ)
@@ -441,15 +443,19 @@ def resolve_backend(
     )
     if layers[0] is None and not any(layers[1:]):
         raise BackendResolutionError(
-            f"no s3 backend found in {cwd}; pass --bucket/--key or --backend-config"
+            f"no backend found in {cwd}; pass --bucket/--key or --backend-config"
         )
     merged = _merge_layers(*layers)
+    backend_type = _as_str(merged.get(BACKEND_TYPE_KEY), BACKEND_TYPE_KEY) or SUPPORTED_BACKEND
+    if backend_type not in SUPPORTED_BACKENDS:
+        raise BackendResolutionError(unsupported_backend_message(backend_type))
     bucket = _as_str(merged.get("bucket"), "bucket")
     key = _as_str(merged.get("key"), "key")
     if not bucket or not key:
         missing = [n for n, v in (("bucket", bucket), ("key", key)) if not v]
         raise BackendResolutionError(f"backend is missing {', '.join(missing)}")
     return BackendConfig(
+        backend_type=backend_type,
         bucket=bucket,
         key=key,
         region=_as_str(merged.get("region"), "region"),
@@ -464,7 +470,7 @@ def resolve_backend(
 
 
 def describe(cfg: BackendConfig) -> str:
-    """One-line human description: ``s3://bucket/key (region, profile, table, lockfile)``."""
+    """One-line human description: ``<type>://bucket/key (region, profile, table, lockfile)``."""
     details = [
         f"region={cfg.region or '-'}",
         f"profile={cfg.profile or '-'}",
@@ -475,4 +481,4 @@ def describe(cfg: BackendConfig) -> str:
         details.append(f"kms={cfg.kms_key_id}")
     if cfg.workspace != "default":
         details.append(f"workspace={cfg.workspace}")
-    return f"s3://{cfg.bucket}/{cfg.key} ({', '.join(details)})"
+    return f"{cfg.backend_type}://{cfg.bucket}/{cfg.key} ({', '.join(details)})"

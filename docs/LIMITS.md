@@ -55,10 +55,13 @@ and `-md5` digest items, or `use_lockfile` `.tflock` objects). Anything else
 (`azurerm`, `gcs`, `http`, `local`, `remote`, `cloud`) is detected during
 backend resolution and refused with the backend type in the message.
 
-Supporting another backend means re-implementing the raw operations in
-`s3state.py` (HEAD, list, copy, delete, conditional JSON writes) and the
-lock-item cleanup for that backend. The registry document itself also lives
-next to the state in the same bucket.
+The architecture is backend-agnostic: everything above the
+`store.StateStore` contract (registry, claims, policy, merge, CLI) never
+touches S3, and `store.make_store` is the only place that picks an
+implementation. Supporting another backend means implementing that contract
+(head, list, copy, delete, conditional JSON writes, digest and lock
+bookkeeping) and, when the object layout differs, its key builders. What
+each candidate backend needs is detailed in [ROADMAP.md](ROADMAP.md).
 
 ## 5. Default workspace only
 
@@ -214,3 +217,5 @@ The missing pieces are the checks above and the base-side write path.
   them.
 - Non-default workspaces, `azurerm` backend, state encryption surgery: see
   4, 5, 6.
+
+Every deferred item, backends included, is tracked in [ROADMAP.md](ROADMAP.md).

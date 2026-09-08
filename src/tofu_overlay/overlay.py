@@ -3,16 +3,15 @@
 This module wires the lower layers together following DESIGN.md sections 3, 5
 and 6. It never writes a state object itself: every state read is a
 ``tofu state pull`` and every state write is a ``tofu state push`` or an
-``apply`` run in a dedicated data directory (invariant 3.1). The only raw S3
-operations are HEAD, ListObjects, CopyObject to an archive key and the deletes
-performed at finalize/abandon.
+``apply`` run in a dedicated data directory (invariant 3.1). The only raw
+store operations are head, list, copy to an archive key and the deletes
+performed at finalize/abandon (see ``store.StateStore``).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -49,13 +48,12 @@ from tofu_overlay.models import (
 )
 from tofu_overlay.output import Console
 from tofu_overlay.registry import Registry
-from tofu_overlay.s3state import S3State
+from tofu_overlay.store import StateStore, make_store
 from tofu_overlay.tofu import TofuRunner, validate_passthrough
 
 DATA_DIR_NAME = ".tofu-overlay"
 BASE_DIR_NAME = "_base"
 BASE_CACHE_FILE = "base_addresses.json"
-ARCHIVE_RE = re.compile(r"@(?P<name>[a-z0-9-]+)\.(?P<status>merged|abandoned|rebase)-\d{8}T\d{6}Z")
 IMPORTS_GLOB = "zz_overlay_*.imports.tf"
 PLAN_GLOB = "tfplan.*"
 NAME_VAR = "TF_VAR_tofu_overlay_name"
@@ -151,7 +149,7 @@ class OverlayService:
         self._name: str | None = None
         self._session = session
         self._runner_factory = runner_factory or TofuRunner
-        self._s3: S3State | None = None
+        self._store: StateStore | None = None
         self._registry: Registry | None = None
         self._knowledge: TypeKnowledge | None = None
         self._repo_root: Path | None = None
@@ -177,17 +175,17 @@ class OverlayService:
         return self._explicit_name is not None
 
     @property
-    def s3(self) -> S3State:
-        """S3/DynamoDB access for the resolved backend."""
-        if self._s3 is None:
-            self._s3 = S3State(self.backend, session=self._session)
-        return self._s3
+    def store(self) -> StateStore:
+        """State store of the resolved backend (built by ``store.make_store``)."""
+        if self._store is None:
+            self._store = make_store(self.backend, session=self._session)
+        return self._store
 
     @property
     def registry(self) -> Registry:
         """Registry document accessor for this base."""
         if self._registry is None:
-            self._registry = Registry(self.s3, self.backend, __version__)
+            self._registry = Registry(self.store, self.backend, __version__)
             self._registry.apply_timeout_min = self.cfg.policy.apply_timeout_min
         return self._registry
 
@@ -217,12 +215,12 @@ class OverlayService:
 
     @property
     def overlay_key(self) -> str:
-        """S3 key of the overlay state."""
+        """Object key of the overlay state."""
         return self.backend.overlay_key(self.name)
 
     @property
     def base_key(self) -> str:
-        """S3 key of the base state."""
+        """Object key of the base state."""
         return self.backend.state_path()
 
     def refuse_symlinked_env(self) -> None:
@@ -409,8 +407,8 @@ class OverlayService:
 
         A missing registry means no overlays; registry errors bubble up.
         """
-        s3 = S3State(cfg, session=self._session)
-        doc, _etag = Registry(s3, cfg, __version__).load()
+        store = make_store(cfg, session=self._session)
+        doc, _etag = Registry(store, cfg, __version__).load()
         ov = doc.overlays.get(name)
         if ov is None or ov.status not in _LIVE:
             return None
@@ -423,7 +421,7 @@ class OverlayService:
         ov = self._remote_overlay(cfg, name)
         if ov is None:
             return None
-        exists = S3State(cfg, session=self._session).head(ov.state_key) is not None
+        exists = make_store(cfg, session=self._session).head(ov.state_key) is not None
         return {
             "ref": ref.name,
             "bucket": cfg.bucket,
@@ -561,7 +559,7 @@ class OverlayService:
                     f"overlay '{ov.name}' belongs to branch '{ov.branch}', "
                     f"current branch is '{branch}' (use --name to force)"
                 )
-        if self.s3.head(ov.state_key) is None:
+        if self.store.head(ov.state_key) is None:
             raise RegistryError(
                 f"overlay state object {ov.state_key} is missing; a missing key is never "
                 "treated as an empty state (run `doctor`)"
@@ -578,7 +576,7 @@ class OverlayService:
 
     def _freshness(self, ov: Overlay) -> tuple[bool, str]:
         """DESIGN 3.8: stale when the base ETag differs from the recorded one."""
-        head = self.s3.head(self.base_key)
+        head = self.store.head(self.base_key)
         if head is None:
             raise ToolError(f"base state object {self.base_key} is missing")
         etag = head["etag"]
@@ -628,7 +626,7 @@ class OverlayService:
                 return json.loads(path.read_text())
             except json.JSONDecodeError:
                 pass
-        head = self.s3.head(self.base_key)
+        head = self.store.head(self.base_key)
         return self._write_base_cache(self._pull_base(), head["etag"] if head else None)
 
     def _base_addresses(self, refresh: bool = False) -> set[str]:
@@ -689,12 +687,8 @@ class OverlayService:
 
     # ------------------------------------------------------------------ archive / delete
 
-    def _overlay_prefix(self) -> str:
-        key = self.backend.overlay_key("")
-        return key[: key.index("@") + 1]
-
     def _archive(self, ov: Overlay, status: str, *, dry_run: bool = False) -> str:
-        """Copy the overlay object to an archive key, then delete object, md5 item and tflock."""
+        """Copy the overlay object to an archive key, then delete object, digest item and lock."""
         key = self._state_key(ov)
         archive_key = self.backend.archive_key(ov.name, status, _archive_timestamp())
         steps = [
@@ -707,7 +701,7 @@ class OverlayService:
             self.console.info(("[dry-run] " if dry_run else "") + step)
         if dry_run:
             return archive_key
-        self.s3.copy(key, archive_key)
+        self.store.copy(key, archive_key)
         self._delete_state_object(key)
         return archive_key
 
@@ -715,10 +709,10 @@ class OverlayService:
         """Delete an overlay state object with its digest item and lock file (never the base)."""
         if key == self.base_key:
             raise RegistryError(f"refusing to delete the base state {key}")
-        self.s3.delete(key)
+        self.store.delete(key)
         if self.backend.dynamodb_table:
-            self.s3.delete_md5_item(key)
-        self.s3.delete_lockfile(key)
+            self.store.delete_digest_item(key)
+        self.store.delete_lock_marker(key)
 
     def _remove_data_dir(self) -> None:
         if self.data_dir.exists():
@@ -739,7 +733,7 @@ class OverlayService:
         existing = doc.overlays.get(name)
         resuming = existing is not None and existing.status == Status.CREATING
         self._refuse_create(doc, existing, force_name=force_name)
-        base_head = self.s3.head(self.base_key)
+        base_head = self.store.head(self.base_key)
         if base_head is None:
             raise ToolError(
                 f"base state object {self.base_key} does not exist (no --empty-base in v1)"
@@ -792,11 +786,11 @@ class OverlayService:
                 )
 
     def _refuse_unregistered_overlay_object(self) -> None:
-        if self.s3.exists(self.overlay_key):
+        if self.store.exists(self.overlay_key):
             raise RegistryError(
                 f"object {self.overlay_key} already exists outside the registry; run `doctor`"
             )
-        if self.backend.dynamodb_table and self.s3.md5_item_exists(self.overlay_key):
+        if self.backend.dynamodb_table and self.store.digest_item_exists(self.overlay_key):
             raise RegistryError(
                 f"DynamoDB digest item for {self.overlay_key} exists outside the registry; "
                 "run `doctor`"
@@ -832,7 +826,7 @@ class OverlayService:
     def _push_forked(self, ov: Overlay, forked: dict) -> str:
         """Push the forked document to the overlay key; skip when a resume already did."""
         runner = self._overlay_runner()
-        if self.s3.exists(self.overlay_key):
+        if self.store.exists(self.overlay_key):
             current = runner.state_pull()
             if ov.lineage and current.get("lineage") == ov.lineage:
                 self.console.info("overlay state already pushed, skipping")
@@ -1010,7 +1004,7 @@ class OverlayService:
         else:
             filled = self._claims_from_state(claims, state)
             to_release -= statemod.addresses(state)  # only release what is really gone
-        head = self.s3.head(self.base_key)
+        head = self.store.head(self.base_key)
         return self.registry.finish_apply(
             self.name,
             ok=ok,
@@ -1046,7 +1040,7 @@ class OverlayService:
     def status(self) -> dict[str, Any]:
         """Overlays of this base with freshness, claims and pending reverts (read-only)."""
         doc, _ = self.registry.load()
-        head = self.s3.head(self.base_key)
+        head = self.store.head(self.base_key)
         base_etag = head["etag"] if head else None
         current: str | None
         try:
@@ -1159,7 +1153,7 @@ class OverlayService:
         )
         self._confirm_typed("rebase", yes=yes)
         archive_key = self.backend.archive_key(ov.name, "rebase", _archive_timestamp())
-        self.s3.copy(self._state_key(ov), archive_key)
+        self.store.copy(self._state_key(ov), archive_key)
         self.console.info(f"previous overlay state archived at {archive_key}")
         self._overlay_runner().state_push(new_doc)
         self._write_base_cache(base_doc, base_etag)
@@ -1226,7 +1220,7 @@ class OverlayService:
         self.console.success(f"overlay '{ov.name}' abandoned")
 
     def _overlay_state_or_none(self, ov: Overlay) -> dict | None:
-        if ov.status == Status.CREATING and self.s3.head(ov.state_key) is None:
+        if ov.status == Status.CREATING and self.store.head(ov.state_key) is None:
             return None
         return self._validate_overlay(ov)
 
@@ -1331,8 +1325,8 @@ class OverlayService:
     # ------------------------------------------------------------------ gc
 
     def _archives(self) -> list[str]:
-        keys = self.s3.list_prefix(self._overlay_prefix())
-        return sorted(k for k in keys if ARCHIVE_RE.search(k))
+        keys = self.store.list_prefix(self.backend.overlay_prefix())
+        return sorted(k for k in keys if self.backend.is_archive_key(k))
 
     def gc(self, *, purge: bool, yes: bool) -> list[dict[str, Any]]:
         """Report overlays without a remote branch and archived states; --purge deletes archives."""
@@ -1355,17 +1349,17 @@ class OverlayService:
             ):
                 raise ToolError("purge aborted")
             for key in archives:
-                self.s3.delete(key)
+                self.store.delete(key)
                 self.console.info(f"deleted {key}")
         return findings
 
     # ------------------------------------------------------------------ doctor
 
     def doctor(self) -> list[dict[str, Any]]:
-        """Read-only consistency report between registry, S3 objects, DynamoDB items and repo."""
+        """Read-only consistency report between registry, state objects, lock items and repo."""
         findings: list[dict[str, Any]] = []
         doc, _ = self._load_for_doctor(findings)
-        keys = self.s3.list_prefix(self._overlay_prefix())
+        keys = self.store.list_prefix(self.backend.overlay_prefix())
         self._doctor_objects(doc, keys, findings)
         self._doctor_registry(doc, findings)
         self._doctor_repo(doc, findings)
@@ -1390,7 +1384,7 @@ class OverlayService:
                 findings.append(
                     {"level": "warning", "code": "tflock", "message": f"lock file {key}"}
                 )
-            elif ARCHIVE_RE.search(key):
+            elif self.backend.is_archive_key(key):
                 findings.append({"level": "info", "code": "archive", "message": key})
             elif key not in registered:
                 findings.append(
@@ -1400,12 +1394,12 @@ class OverlayService:
 
     def _doctor_registry(self, doc: RegistryDoc, findings: list[dict]) -> None:
         for name, ov in sorted(doc.overlays.items()):
-            if ov.is_live() and not self.s3.exists(ov.state_key):
+            if ov.is_live() and not self.store.exists(ov.state_key):
                 findings.append(
                     {"level": "error", "code": "missing-object",
                      "message": f"{name} ({ov.status}) has no object at {ov.state_key}"}
                 )
-                if self.backend.dynamodb_table and self.s3.md5_item_exists(ov.state_key):
+                if self.backend.dynamodb_table and self.store.digest_item_exists(ov.state_key):
                     findings.append({"level": "warning", "code": "orphan-md5",
                                      "message": f"digest item without object for {ov.state_key}"})
             if ov.status == Status.APPLYING and self.registry.stale_applying(
@@ -1414,7 +1408,7 @@ class OverlayService:
                 findings.append({"level": "warning", "code": "stale-applying",
                                  "message": f"{name} applying since {ov.applying_since}"})
             if self.backend.dynamodb_table and ov.is_live():
-                lock = self.s3.lock_item(ov.state_key)
+                lock = self.store.lock_info(ov.state_key)
                 if lock:
                     findings.append({"level": "warning", "code": "locked",
                                      "message": f"{name} is locked: {lock}"})

@@ -1,7 +1,8 @@
 """Registry document: load with fail-closed rules, CAS updates, status machine, claims.
 
 The registry is one JSON document per base state, stored next to it under
-``<key>.overlays.json`` and written with S3 conditional requests. Every mutation
+``<key>.overlays.json`` and written with the store's compare-and-swap
+``put_json`` (S3: conditional requests). Every mutation
 goes through :meth:`Registry.update`, which implements the GET/mutate/PUT-IfMatch
 loop described in DESIGN.md section 5. Mutation callbacks must be idempotent
 (set-by-key, never append) so that a retry after a lost conflict converges.
@@ -36,7 +37,7 @@ from tofu_overlay.models import (
     Violation,
     utcnow_iso,
 )
-from tofu_overlay.s3state import CasConflict, S3State
+from tofu_overlay.store import CasConflict, StateStore
 
 REGISTRY_VERSION = 1
 
@@ -58,7 +59,7 @@ def _identity_key(claim: Claim) -> str | None:
 
 
 def _dump(doc: RegistryDoc) -> dict[str, Any]:
-    """JSON-ready dump used both for S3 writes and for idempotency comparisons."""
+    """JSON-ready dump used both for store writes and for idempotency comparisons."""
     return doc.model_dump(mode="json", by_alias=True)
 
 
@@ -81,8 +82,8 @@ def _merge_claim(existing: Claim | None, wanted: Claim, now: str) -> Claim:
 class Registry:
     """Access to the per-base registry document with compare-and-swap updates."""
 
-    def __init__(self, s3: S3State, cfg: BackendConfig, tool_version: str) -> None:
-        self.s3 = s3
+    def __init__(self, store: StateStore, cfg: BackendConfig, tool_version: str) -> None:
+        self.store = store
         self.cfg = cfg
         self.tool_version = tool_version
         self.key: str = cfg.registry_key()
@@ -95,12 +96,6 @@ class Registry:
         self.apply_timeout_min: int = 90
 
     # ----------------------------------------------------------------- loading
-
-    def _overlay_prefix(self) -> str:
-        """S3 prefix matching every ``<key>@*`` overlay object of this base."""
-        marker = self.cfg.overlay_key("")
-        head, sep, _tail = marker.rpartition("@")
-        return head + sep if sep else marker
 
     def _empty_doc(self) -> RegistryDoc:
         return RegistryDoc(
@@ -151,13 +146,13 @@ class Registry:
     def load(self) -> tuple[RegistryDoc, str | None]:
         """Read the registry; fail closed on missing-with-overlays, invalid or newer docs."""
         try:
-            found = self.s3.get_json(self.key)
+            found = self.store.get_json(self.key)
         except RegistryError:
             raise
         except Exception as exc:  # boto3 / JSON errors: registry unreachable or unreadable
             raise RegistryError(f"registry {self.key}: unreadable ({exc})") from exc
         if found is None:
-            stray = self.s3.list_prefix(self._overlay_prefix())
+            stray = self.store.list_prefix(self.cfg.overlay_prefix())
             if stray:
                 raise RegistryError(
                     f"registry {self.key} is missing but overlay objects exist "
@@ -192,7 +187,7 @@ class Registry:
             doc, etag = self.load()
             if etag == "":
                 raise RegistryError(
-                    f"registry {self.key}: S3 returned an empty ETag; refusing an "
+                    f"registry {self.key}: the store returned an empty ETag; refusing an "
                     "unconditional write"
                 )
             before = _dump(doc)
@@ -202,7 +197,7 @@ class Registry:
             if after == before:
                 return doc
             try:
-                self.s3.put_json(self.key, after, if_match=etag, if_none_match=etag is None)
+                self.store.put_json(self.key, after, if_match=etag, if_none_match=etag is None)
                 return doc
             except CasConflict:
                 self.sleep(self._backoff(attempt))

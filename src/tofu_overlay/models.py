@@ -7,6 +7,7 @@ imports from here. Keep it free of I/O.
 from __future__ import annotations
 
 import posixpath
+import re
 import uuid
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
@@ -117,15 +118,28 @@ class ClaimKind(StrEnum):
 # Backend
 # --------------------------------------------------------------------------- #
 
+ARCHIVE_KEY_RE = re.compile(
+    r"@(?P<name>[a-z0-9-]+)\.(?P<status>merged|abandoned|rebase)-\d{8}T\d{6}Z"
+)
+
 
 class BackendConfig(BaseModel):
-    """Resolved `s3` backend of a stack plus key builders for derived objects.
+    """Resolved backend of a stack plus key builders for derived objects.
+
+    ``backend_type`` names the tofu backend (``s3`` is the only one with a
+    :class:`~tofu_overlay.store.StateStore` implementation today; the other
+    attributes are the ``s3`` ones). Every derived object key (overlay state,
+    registry document, archive, lock ids) is built here and nowhere else, so a
+    future backend that needs its own key layout (flat blob names, a container
+    instead of a bucket, generation tokens...) only has to change these
+    builders, see docs/ROADMAP.md.
 
     Key builders are extension-aware: when the base key carries an extension
     (``a/b/terraform.tfstate``) the suffix is inserted before it
     (``a/b/terraform@NAME.tfstate``, ``a/b/terraform.overlays.json``).
     """
 
+    backend_type: str = "s3"
     bucket: str
     key: str
     region: str | None = None
@@ -187,6 +201,10 @@ class BackendConfig(BaseModel):
         stem, ext = self._split_key()
         status_str = status.value if isinstance(status, Status) else str(status)
         return f"{stem}@{name}.{status_str}-{ts}{ext}"
+
+    def is_archive_key(self, key: str) -> bool:
+        """True when ``key`` has the archive layout produced by :meth:`archive_key`."""
+        return ARCHIVE_KEY_RE.search(key) is not None
 
     def lock_id(self, path: str) -> str:
         """DynamoDB ``LockID`` of a state object: ``<bucket>/<path>``."""

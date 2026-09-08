@@ -22,6 +22,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `finalize` warning about consumer overlays of sibling stacks. Documented in
   docs/MULTI-STACK.md; LIMITS.md §7 rewritten accordingly.
 
+### Changed
+
+- Backend-agnostic store layer: new `store` module with the `StateStore`
+  protocol, `CasConflict` (re-exported by `s3state`) and the
+  `make_store(cfg, session=None)` factory dispatching on the new
+  `BackendConfig.backend_type` field (`s3` only; other types raise
+  `backend '<type>' is not supported yet, see docs/ROADMAP.md`).
+  `Registry`, `OverlayService` and the CLI are typed against `StateStore`
+  and no longer import `S3State`; `OverlayService.s3` is now
+  `OverlayService.store`. `S3State` digest/lock methods renamed to
+  backend-neutral names (`digest_item_exists`, `delete_digest_item`,
+  `lock_info`, `delete_lock_marker`).
+- `backend.parse_hcl_backend` and `read_cached_backend` report the backend
+  type (`backend_type` entry) instead of refusing non-`s3` blocks;
+  `resolve_backend` refuses unsupported types with the message above.
+- Overlay prefix and archive-key detection go through `BackendConfig`
+  (`overlay_prefix`, `is_archive_key`); no manual `@` key building outside
+  the key builders.
+- docs/ROADMAP.md: single list of deferred work, per-backend requirements
+  (`azurerm`, `gcs`, `http`, `local`) and extension points; linked from the
+  README, DESIGN and LIMITS. MODULES.md updated for the new module.
+
 ### Fixed
 
 - `apply` asks its own confirmation: a saved plan never prompts in tofu.

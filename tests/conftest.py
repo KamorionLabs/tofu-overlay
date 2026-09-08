@@ -131,15 +131,15 @@ def ddb_client(boto_session: boto3.Session):
 
 @pytest.fixture
 def s3state(backend_cfg, boto_session: boto3.Session):
-    """An S3State wired to the moto sandbox."""
-    from tofu_overlay.s3state import S3State
+    """The ``s3`` StateStore (an S3State) wired to the moto sandbox, via make_store."""
+    from tofu_overlay.store import make_store
 
-    return S3State(backend_cfg, session=boto_session)
+    return make_store(backend_cfg, session=boto_session)
 
 
 @pytest.fixture
 def registry(s3state, backend_cfg):
-    """A Registry over the moto-backed S3State."""
+    """A Registry over the moto-backed store."""
     from tofu_overlay.registry import Registry
 
     return Registry(s3state, backend_cfg, "0.1.0")

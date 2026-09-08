@@ -1,4 +1,8 @@
-"""Tests for tofu_overlay.s3state against moto (S3 conditional writes, SSE, DynamoDB items)."""
+"""Tests for tofu_overlay.s3state against moto (S3 conditional writes, SSE, DynamoDB items).
+
+``S3State`` is the ``s3`` implementation of ``tofu_overlay.store.StateStore``; the
+protocol methods are exercised here under their backend-neutral names.
+"""
 
 from __future__ import annotations
 
@@ -125,22 +129,22 @@ class TestJsonCas:
 
 
 class TestDynamoDb:
-    def test_md5_item(self, s3state: S3State, ddb_client, backend_cfg: BackendConfig) -> None:
+    def test_digest_item(self, s3state: S3State, ddb_client, backend_cfg: BackendConfig) -> None:
         path = backend_cfg.overlay_key("feat-1a2b3c")
-        assert s3state.md5_item_exists(path) is False
+        assert s3state.digest_item_exists(path) is False
         ddb_client.put_item(
             TableName=LOCK_TABLE,
             Item={"LockID": {"S": backend_cfg.md5_lock_id(path)}, "Digest": {"S": "abc"}},
         )
-        assert s3state.md5_item_exists(path) is True
-        s3state.delete_md5_item(path)
-        assert s3state.md5_item_exists(path) is False
+        assert s3state.digest_item_exists(path) is True
+        s3state.delete_digest_item(path)
+        assert s3state.digest_item_exists(path) is False
         # deleting an absent item is not an error
-        s3state.delete_md5_item(path)
+        s3state.delete_digest_item(path)
 
-    def test_lock_item(self, s3state: S3State, ddb_client, backend_cfg: BackendConfig) -> None:
+    def test_lock_info(self, s3state: S3State, ddb_client, backend_cfg: BackendConfig) -> None:
         path = backend_cfg.overlay_key("feat-1a2b3c")
-        assert s3state.lock_item(path) is None
+        assert s3state.lock_info(path) is None
         info = {
             "ID": "8c5e5c3a-1234-4bcd-9abc-0123456789ab",
             "Operation": "OperationTypeApply",
@@ -153,21 +157,23 @@ class TestDynamoDb:
             TableName=LOCK_TABLE,
             Item={"LockID": {"S": backend_cfg.lock_id(path)}, "Info": {"S": json.dumps(info)}},
         )
-        got = s3state.lock_item(path)
+        got = s3state.lock_info(path)
         assert got is not None
         assert got["ID"] == info["ID"] or got.get("Info") == json.dumps(info)
 
     def test_no_table_configured(self, boto_session) -> None:
         cfg = BackendConfig(bucket=BUCKET, key=BASE_KEY, region=REGION, dynamodb_table=None)
         state = S3State(cfg, session=boto_session)
-        assert state.md5_item_exists(BASE_KEY) is False
-        assert state.lock_item(BASE_KEY) is None
-        state.delete_md5_item(BASE_KEY)
+        assert state.digest_item_exists(BASE_KEY) is False
+        assert state.lock_info(BASE_KEY) is None
+        state.delete_digest_item(BASE_KEY)
 
-    def test_delete_lockfile(self, s3state: S3State, s3_client, backend_cfg: BackendConfig) -> None:
+    def test_delete_lock_marker(
+        self, s3state: S3State, s3_client, backend_cfg: BackendConfig
+    ) -> None:
         path = backend_cfg.overlay_key("feat-1a2b3c")
         s3_client.put_object(Bucket=BUCKET, Key=f"{path}.tflock", Body=b'{"ID": "x"}')
-        s3state.delete_lockfile(path)
+        s3state.delete_lock_marker(path)
         assert s3state.exists(f"{path}.tflock") is False
         # absent lockfile is fine
-        s3state.delete_lockfile(path)
+        s3state.delete_lock_marker(path)

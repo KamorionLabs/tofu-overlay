@@ -71,13 +71,18 @@ class TestParseHclBackend:
     def test_empty_directory(self, tmp_path: Path) -> None:
         assert backend.parse_hcl_backend(tmp_path) is None
 
-    def test_azurerm_refused(self, env_dir: Path) -> None:
+    def test_backend_type_reported(self, env_dir: Path) -> None:
+        (env_dir / "versions.tf").write_text(S3_BLOCK, encoding="utf-8")
+        attrs = backend.parse_hcl_backend(env_dir)
+        assert attrs is not None
+        assert attrs["backend_type"] == "s3"
+
+    def test_azurerm_parsed_not_refused(self, env_dir: Path) -> None:
         (env_dir / "backend.tf").write_text(AZURERM_BLOCK, encoding="utf-8")
-        with pytest.raises(BackendResolutionError) as exc:
-            backend.parse_hcl_backend(env_dir)
-        assert "azurerm" in str(exc.value)
-        assert isinstance(exc.value, ToolError)
-        assert exc.value.exit_code == ExitCode.ERROR
+        attrs = backend.parse_hcl_backend(env_dir)
+        assert attrs is not None
+        assert attrs["backend_type"] == "azurerm"
+        assert attrs["container_name"] == "tfstate"
 
     def test_interpolated_values_kept_raw(self, env_dir: Path) -> None:
         (env_dir / "backend.tf").write_text(
@@ -145,6 +150,22 @@ class TestCachedBackend:
         assert attrs is not None
         assert attrs["bucket"] == BUCKET
         assert attrs["key"] == BASE_KEY
+        assert attrs["backend_type"] == "s3"
+
+    def test_cached_backend_of_another_type_is_reported(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / ".terraform"
+        data_dir.mkdir()
+        (data_dir / "terraform.tfstate").write_text(
+            json.dumps({"backend": {"type": "gcs", "config": {"bucket": "b", "prefix": "p"}}}),
+            encoding="utf-8",
+        )
+        attrs = backend.read_cached_backend(data_dir)
+        assert attrs == {"bucket": "b", "prefix": "p", "backend_type": "gcs"}
+        with pytest.raises(ToolError) as exc:
+            backend.resolve_backend(
+                tmp_path, overrides={}, backend_config_files=[], data_dir=data_dir
+            )
+        assert "backend 'gcs' is not supported yet, see docs/ROADMAP.md" in str(exc.value)
 
     def test_missing_cache(self, tmp_path: Path) -> None:
         assert backend.read_cached_backend(tmp_path / ".terraform") is None
@@ -272,9 +293,22 @@ class TestResolveBackend:
 
     def test_azurerm_hcl_refused_on_resolve(self, env_dir: Path) -> None:
         (env_dir / "backend.tf").write_text(AZURERM_BLOCK, encoding="utf-8")
-        with pytest.raises(BackendResolutionError) as exc:
+        with pytest.raises(ToolError) as exc:
             backend.resolve_backend(env_dir, overrides={}, backend_config_files=[], data_dir=None)
-        assert "azurerm" in str(exc.value)
+        message = str(exc.value)
+        assert "backend 'azurerm' is not supported yet, see docs/ROADMAP.md" in message
+        assert "lease" in message  # azurerm-specific hint kept
+        assert isinstance(exc.value, BackendResolutionError)
+        assert exc.value.exit_code == ExitCode.ERROR
+
+    def test_backend_type_defaults_to_s3(self, env_dir: Path) -> None:
+        cfg = backend.resolve_backend(
+            env_dir,
+            overrides={"bucket": BUCKET, "key": BASE_KEY},
+            backend_config_files=[],
+            data_dir=None,
+        )
+        assert cfg.backend_type == "s3"
 
 
 class TestDescribe:

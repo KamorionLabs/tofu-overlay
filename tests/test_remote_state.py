@@ -20,7 +20,7 @@ from tofu_overlay.models import BackendConfig, Status, ToolConfig
 from tofu_overlay.output import Console
 from tofu_overlay.overlay import NAME_VAR, REMOTE_KEYS_VAR, OverlayService
 from tofu_overlay.registry import Registry
-from tofu_overlay.s3state import S3State
+from tofu_overlay.store import make_store
 
 NAME = "abc-12-reports-3f9a1c"
 PRODUCER_KEY = "acme/webshop/eks/dev"
@@ -67,7 +67,7 @@ def _register(
 ):
     """Register overlay NAME on the base of ``cfg`` (and push a dummy state object)."""
     ov = make_overlay(name=NAME, status=status, state_key=cfg.overlay_key(NAME))
-    Registry(S3State(cfg, session=boto_session), cfg, __version__).update(
+    Registry(make_store(cfg, session=boto_session), cfg, __version__).update(
         lambda d: d.overlays.__setitem__(NAME, ov)
     )
     if with_object:
@@ -186,7 +186,7 @@ class TestRemoteOverlayKeys:
         svc = _service(tmp_path, backend_cfg, boto_session, console)
         assert svc.remote_overlay_keys(NAME) == {PRODUCER_KEY: ov.state_key}
         # nothing of that name in the current bucket: it must not be mapped from there
-        assert not S3State(backend_cfg, session=boto_session).exists(ov.state_key)
+        assert not make_store(backend_cfg, session=boto_session).exists(ov.state_key)
 
 
 class RecordingRunner:
