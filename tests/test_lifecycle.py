@@ -1045,6 +1045,18 @@ class TestOnlyClaimsLifecycle:
             )
         assert _overlay_plans(service) == []
 
+    def test_mutual_exclusion_is_reported_before_the_ci_guard(self, service, monkeypatch):
+        """In CI without --yes the precise message wins over the --accept-drift guard."""
+        service.create()
+        monkeypatch.setenv("CI", "true")
+        FakeRunner.calls.clear()
+        with pytest.raises(PolicyError, match="mutually exclusive"):
+            service.apply(
+                auto_approve=True, allow_stale=False, allow_behind=False,
+                accept_drift=True, only_claims=True,
+            )
+        assert _overlay_plans(service) == []
+
     def test_without_drift_or_ignored_it_is_a_normal_apply(self, service):
         service.create()
         FakeRunner.calls.clear()
@@ -1433,7 +1445,7 @@ class TestCli:
         warnings = json.loads(result.stdout)["results"][0]["warnings"]
         assert any(w.startswith("trunk drift:") for w in warnings)
 
-    def test_only_claims_flag_and_json_output(self, cli_env):
+    def test_only_claims_flag_and_json_output(self, cli_env, monkeypatch):
         assert _invoke(cli_env, "create").exit_code == 0
         _trunk_moves_role()
         result = _invoke(
@@ -1441,6 +1453,13 @@ class TestCli:
         )
         assert result.exit_code == int(ExitCode.POLICY), result.output
         assert "mutually exclusive" in result.output
+
+        # in CI without --yes the mutual exclusion is still what the operator is told
+        monkeypatch.setenv("CI", "true")
+        result = _invoke(cli_env, "apply", "--only-claims", "--accept-drift")
+        assert result.exit_code == int(ExitCode.POLICY), result.output
+        assert "mutually exclusive" in result.output
+        monkeypatch.delenv("CI")
 
         result = _invoke(cli_env, "--yes", "apply", "--auto-approve", "--only-claims")
         assert result.exit_code == 0, result.output

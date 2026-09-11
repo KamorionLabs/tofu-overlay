@@ -323,7 +323,14 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
 Tests use `moto` for S3/DynamoDB and a fake runner for tofu; no cloud
-credentials are needed.
+credentials are needed. The suite is hermetic: autouse fixtures clear the CI
+flags (`CI`, `TF_BUILD`) and the `TOFU_OVERLAY_*` / `TF_WORKSPACE` overrides,
+so it gives the same result whatever the shell exports. To reproduce a CI run
+locally, set the flag explicitly:
+
+```bash
+CI=true TF_BUILD=True .venv/bin/pytest -q
+```
 
 ## License
 

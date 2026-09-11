@@ -28,6 +28,9 @@ tool to CI mode:
 - `apply --auto-approve` is accepted only together with `--yes`; a plain
   `apply` asks the tool's own confirmation, which is refused in CI (a saved
   plan never prompts in tofu);
+- `apply --accept-drift` also needs `--yes`; a combination that is invalid on
+  its own (`--only-claims` with `--accept-drift`) is reported as mutually
+  exclusive first, so the message names the real problem;
 - `TF_CLI_ARGS`, `TF_CLI_ARGS_plan`, `TF_CLI_ARGS_apply`... are removed from
   the environment of every tofu run: they would bypass the pass-through
   filter (`-target`, `-lock=false`...).

@@ -106,6 +106,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `apply` reports `--only-claims` and `--accept-drift` as mutually exclusive
+  before the "`--accept-drift` requires `--yes` in CI" guard, so the operator
+  gets the precise message in a pipeline too (same order in the CLI and in
+  `OverlayService.apply`).
+- The test suite is hermetic with respect to the ambient environment: autouse
+  fixtures drop the CI flags (`CI`, `TF_BUILD`) and the tool's own overrides
+  (`TOFU_OVERLAY_*`, `TF_WORKSPACE`), so `pytest` behaves the same on a
+  developer machine and on a runner that exports `CI=true`. Tests that
+  exercise CI or an override set the variable themselves.
 - `apply` asks its own confirmation: a saved plan never prompts in tofu.
 - `TF_CLI_ARGS*` are dropped from the tofu environment; `-out` is rejected.
 - Claims of own resources deleted by a plan are released after the apply;

@@ -1124,12 +1124,12 @@ class OverlayService:
         ``apply_targets`` holds the target set of the last call (``None`` when
         the full plan was applied).
         """
+        if only_claims and accept_drift:
+            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
         if config.is_ci() and (allow_stale or allow_behind):
             raise PolicyError("--allow-stale/--allow-behind are refused in CI")
         if config.is_ci() and accept_drift and not yes:
             raise PolicyError("--accept-drift requires --yes in CI")
-        if only_claims and accept_drift:
-            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
         self.apply_targets = None
         doc, ov = self._load()
         self._gate(ov, {Status.ACTIVE, Status.DIRTY}, "apply")

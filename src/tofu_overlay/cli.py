@@ -362,12 +362,12 @@ def apply(
 
     def body() -> int:
         setup = _setup(ctx, mutating=True)
+        if only_claims and accept_drift:
+            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
         if auto_approve and not (config.is_ci() or setup.g.yes):
             raise PolicyError("--auto-approve requires --yes outside CI")
         if accept_drift and config.is_ci() and not setup.g.yes:
             raise PolicyError("--accept-drift requires --yes in CI")
-        if only_claims and accept_drift:
-            raise PolicyError("--only-claims and --accept-drift are mutually exclusive")
         svc = setup.service()
         ov = svc.apply(
             auto_approve=auto_approve,

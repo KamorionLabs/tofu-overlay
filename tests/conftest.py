@@ -43,6 +43,50 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AWS_PROFILE", raising=False)
 
 
+CI_ENV_VARS: tuple[str, ...] = ("CI", "TF_BUILD")
+"""Environment variables the tool reads to detect a CI run (``config.is_ci``)."""
+
+
+@pytest.fixture(autouse=True)
+def not_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test in "not CI" mode whatever the ambient environment says.
+
+    ``config.is_ci`` is true on ``CI=true`` (every CI provider, GitHub Actions
+    included) and ``config.is_ado`` on ``TF_BUILD=True`` (Azure DevOps, also read
+    by ``output`` for its ``##vso`` annotations). Left ambient, those flags send
+    several tests down a different code path than on a developer machine. Tests
+    that exercise CI behaviour set the variable themselves.
+    """
+    for name in CI_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+TOOL_ENV_VARS: tuple[str, ...] = (
+    "TOFU_OVERLAY_NAME",
+    "TOFU_OVERLAY_BINARY",
+    "TOFU_OVERLAY_BUCKET",
+    "TOFU_OVERLAY_KEY",
+    "TOFU_OVERLAY_REGION",
+    "TOFU_OVERLAY_PROFILE",
+    "TOFU_OVERLAY_DYNAMODB_TABLE",
+    "TF_WORKSPACE",
+)
+"""Overrides the tool honours from the environment (naming, backend, workspace)."""
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_tool_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the tool's own environment overrides so the ambient shell cannot leak in.
+
+    A machine that exports ``TF_WORKSPACE`` or any ``TOFU_OVERLAY_*`` override
+    would otherwise change the overlay name, the resolved backend or the
+    workspace gate under the tests' feet. Tests that exercise an override set it
+    themselves.
+    """
+    for name in TOOL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def aws() -> Iterator[None]:
     """Activate moto for the duration of a test."""
