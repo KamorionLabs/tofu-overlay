@@ -928,6 +928,54 @@ class TestTrunkDriftLifecycle:
         assert _trunk_plans(service) == []
 
 
+class TestMergeWithTrunkDrift:
+    """`merge` classifies base updates exactly as `plan` does (DESIGN 8 / 7.8)."""
+
+    def _applied_with_drift(self, service) -> None:
+        """Overlay applied on a base that lags the trunk (only the claims applied)."""
+        service.create()
+        _trunk_moves_role()
+        service.apply(auto_approve=True, allow_stale=False, allow_behind=False, only_claims=True)
+
+    def test_trunk_drift_does_not_block_the_merge(self, service, console, env_repo):
+        self._applied_with_drift(service)
+        FakeRunner.plan_cwds.clear()
+        path = MergeService(service).merge(
+            allow_import_updates=False, accept_recreate=[], allow_unapplied=False, yes=True
+        )
+        assert path == env_repo / IMPORTS_FILENAME.format(name=service.name)
+        assert read_imports_addresses(path) == {NEW_ADDRESS: NEW_BUCKET}
+        assert _status_of(service) == Status.MERGING
+        out = console.stderr.getvalue()
+        assert f"trunk drift tolerated: 1 address(es) ({ROLE_ADDRESS})" in out
+        assert "trunk is not applied on this base" in out
+        assert "update outside the overlay's claims" not in out
+        # the baseline `apply` computed is reused: no extra trunk plan
+        assert _trunk_plans(service) == []
+
+    def test_a_foreign_update_still_blocks_the_merge(self, service, env_repo):
+        self._applied_with_drift(service)
+        # the branch changes a base resource the trunk leaves alone and nothing claims
+        FakeRunner.desired["aws_s3_bucket.logs"]["attrs"] = {"tags": {"owner": "branch"}}
+        with pytest.raises(PolicyError, match="aws_s3_bucket.logs: update outside"):
+            MergeService(service).merge(
+                allow_import_updates=False, accept_recreate=[], allow_unapplied=False, yes=True
+            )
+        assert not (env_repo / IMPORTS_FILENAME.format(name=service.name)).exists()
+        assert _status_of(service) == Status.ACTIVE
+
+    def test_without_a_baseline_the_merge_stays_strict(self, service, env_repo, console):
+        self._applied_with_drift(service)
+        git("update-ref", "-d", "refs/remotes/origin/main", cwd=env_repo)
+        with pytest.raises(PolicyError, match=f"{ROLE_ADDRESS}: update outside"):
+            MergeService(service).merge(
+                allow_import_updates=False, accept_recreate=[], allow_unapplied=False, yes=True
+            )
+        assert "trunk baseline unavailable" in console.stderr.getvalue()
+        assert not (env_repo / IMPORTS_FILENAME.format(name=service.name)).exists()
+        assert _status_of(service) == Status.ACTIVE
+
+
 def _overlay_plans(service) -> list[list[str]]:
     return [c for c in FakeRunner.calls if c[0] == "plan" and c[1] == service.overlay_key]
 

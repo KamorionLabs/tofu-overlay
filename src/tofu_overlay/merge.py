@@ -20,9 +20,11 @@ from tofu_overlay.models import (
     Claim,
     ClaimKind,
     Overlay,
+    OverlayError,
     PolicyError,
     Status,
     ToolError,
+    VerifyResult,
     Violation,
     new_run_id,
     utcnow_iso,
@@ -217,11 +219,16 @@ class MergeService:
         path = write_imports(svc.cwd, ov.name, content)
         svc.console.info(f"wrote {path.name} ({len(rendered.create_claims())} import block(s))")
         try:
-            ok, errors, verify_warnings = self.verify(accepted=accepted)
-            for w in verify_warnings:
+            result = self.verify(accepted=accepted)
+            for w in result.warnings:
                 svc.console.warn(w)
-            if not ok:
-                raise PolicyError("merge verification failed: " + "; ".join(errors))
+            if result.drift:
+                svc.console.info(
+                    f"trunk drift tolerated: {len(result.drift)} address(es) "
+                    f"({', '.join(result.drift)})"
+                )
+            if not result.ok:
+                raise PolicyError("merge verification failed: " + "; ".join(result.errors))
             if not svc.console.confirm(f"Freeze overlay '{ov.name}' as merging?", yes=yes):
                 raise ToolError("merge aborted")
             # Precondition: nothing (e.g. a CI apply) touched the entry since it was loaded.
@@ -252,11 +259,35 @@ class MergeService:
         svc.registry.set_status(ov.name, Status.ACTIVE, expect_status={Status.MERGING})
         svc.console.success(f"overlay '{ov.name}' is active again")
 
-    def verify(self, *, accepted: set[str] | None = None) -> tuple[bool, list[str], list[str]]:
+    def _trunk_drift(self) -> dict[str, list[str]] | None:
+        """The trunk baseline (cached with `plan`'s), or None when it cannot be computed.
+
+        A base ``update`` the trunk config produces too is not the branch's
+        doing: it must not block the merge (DESIGN 8). Without a baseline the
+        rule stays the stricter one, so the operator is told why.
+        """
+        try:
+            baseline = self.svc.trunk_baseline()
+        except OverlayError as exc:
+            self.svc.console.warn(
+                f"trunk baseline unavailable ({exc}); every update outside the overlay's "
+                "claims blocks the merge"
+            )
+            return None
+        if baseline is None:
+            self.svc.console.warn(
+                "trunk baseline unavailable; every update outside the overlay's claims "
+                "blocks the merge"
+            )
+        return baseline
+
+    def verify(self, *, accepted: set[str] | None = None) -> VerifyResult:
         """Plan the branch config against the base state (base data dir), check DESIGN 8.
 
         ``accepted`` are the create claims left out of the imports file
         (``--accept-recreate``); by default they are derived from the file.
+        Updates the trunk baseline also carries are tolerated as trunk drift,
+        exactly as `plan` classifies them.
         """
         svc = self.svc
         _doc, ov = svc._load()
@@ -276,6 +307,7 @@ class MergeService:
             knowledge=svc.knowledge,
             allow_import_updates=self.allow_import_updates,
             accepted_recreate=accepted,
+            trunk_drift=self._trunk_drift(),
         )
 
 

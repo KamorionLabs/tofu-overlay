@@ -533,12 +533,12 @@ class TestVerifyImportPlan:
         ]
 
     def test_all_noop(self, merge_me, knowledge) -> None:
-        ok, errors, warnings = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             self.base_changes(), me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is True
-        assert errors == []
-        assert warnings == []
+        assert result.ok is True
+        assert result.errors == []
+        assert result.warnings == []
 
     def test_update_with_only_virtual_attrs_ok(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
@@ -551,10 +551,10 @@ class TestVerifyImportPlan:
             ),
             importing={"id": "fct-acme-dev-reports"},
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is True, errors
+        assert result.ok is True, result.errors
 
     def test_unknown_computed_attrs_are_not_offenders(self, merge_me, knowledge) -> None:
         """after_unknown keys (version, last_modified...) are side-effects of virtual diffs."""
@@ -567,39 +567,39 @@ class TestVerifyImportPlan:
             after_unknown={"version": True, "last_modified": True, "qualified_arn": True},
             importing={"id": "fct-acme-dev-reports"},
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is True, errors
+        assert result.ok is True, result.errors
 
     def test_accepted_recreate_expects_plain_create(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
         changes[0] = mk_change(
             "aws_s3_bucket.reports", ["create"], after={"bucket": "s3-acme-dev-reports"}
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
-        assert any("no import block" in e for e in errors)
-        ok, errors, warnings = plan.verify_import_plan(
+        assert result.ok is False
+        assert any("no import block" in e for e in result.errors)
+        result = plan.verify_import_plan(
             changes,
             me=merge_me,
             knowledge=knowledge,
             allow_import_updates=False,
             accepted_recreate={"aws_s3_bucket.reports"},
         )
-        assert ok is True, errors
-        assert any("recreated by the trunk" in w for w in warnings)
+        assert result.ok is True, result.errors
+        assert any("recreated by the trunk" in w for w in result.warnings)
         # an accepted address that still imports, or plans anything else, is an error
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             self.base_changes(),
             me=merge_me,
             knowledge=knowledge,
             allow_import_updates=False,
             accepted_recreate={"aws_s3_bucket.reports"},
         )
-        assert ok is False
+        assert result.ok is False
 
     def test_managed_resource_in_module_named_data_is_checked(self, merge_me, knowledge) -> None:
         show = {
@@ -625,15 +625,15 @@ class TestVerifyImportPlan:
         }
         changes, _drift, _summary = plan.parse_plan(show)
         assert [c.mode for c in changes] == ["managed", "data"]
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes + self.base_changes(),
             me=merge_me,
             knowledge=knowledge,
             allow_import_updates=False,
         )
-        assert ok is False
-        assert any("module.data.aws_rds_cluster.main" in e for e in errors)
-        assert not any("aws_caller_identity" in e for e in errors)
+        assert result.ok is False
+        assert any("module.data.aws_rds_cluster.main" in e for e in result.errors)
+        assert not any("aws_caller_identity" in e for e in result.errors)
 
     def test_update_with_real_attr_fails(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
@@ -644,11 +644,11 @@ class TestVerifyImportPlan:
             after=dict(LAMBDA_BEFORE, filename="build/reports.zip", memory_size=512),
             importing={"id": "fct-acme-dev-reports"},
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=True
         )
-        assert ok is False
-        assert any("aws_lambda_function.reports" in e and "memory_size" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_lambda_function.reports" in e and "memory_size" in e for e in result.errors)
 
     def test_update_with_replace_paths_fails(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
@@ -660,11 +660,11 @@ class TestVerifyImportPlan:
             importing={"id": "fct-acme-dev-reports"},
             replace_paths=[["filename"]],
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
-        assert any("aws_lambda_function.reports" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_lambda_function.reports" in e for e in result.errors)
 
     def test_replace_fails(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
@@ -676,30 +676,30 @@ class TestVerifyImportPlan:
             importing={"id": "fct-acme-dev-reports"},
             replace_paths=[["function_name"]],
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=True
         )
-        assert ok is False
-        assert any("aws_lambda_function.reports" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_lambda_function.reports" in e for e in result.errors)
 
     def test_create_claim_without_importing_fails(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
         changes[0] = mk_change(
             "aws_s3_bucket.reports", ["create"], after={"bucket": "s3-acme-dev-reports"}
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
-        assert any("aws_s3_bucket.reports" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_s3_bucket.reports" in e for e in result.errors)
 
     def test_create_claim_missing_from_plan_fails(self, merge_me, knowledge) -> None:
         changes = self.base_changes()[1:]
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
-        assert any("aws_s3_bucket.reports" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_s3_bucket.reports" in e for e in result.errors)
 
     def test_update_claim_address_may_update(self, merge_me, knowledge) -> None:
         changes = self.base_changes() + [
@@ -710,28 +710,28 @@ class TestVerifyImportPlan:
                 after={"description": "b"},
             )
         ]
-        ok, errors, warnings = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is True, errors
-        assert warnings == []
+        assert result.ok is True, result.errors
+        assert result.warnings == []
 
     def test_foreign_update_fails_unless_allowed(self, merge_me, knowledge) -> None:
         changes = self.base_changes()
         changes[2] = mk_change(
             "aws_s3_bucket.assets", ["update"], before={"tags": {}}, after={"tags": {"env": "dev"}}
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
-        assert any("aws_s3_bucket.assets" in e for e in errors)
-        ok, errors, warnings = plan.verify_import_plan(
+        assert result.ok is False
+        assert any("aws_s3_bucket.assets" in e for e in result.errors)
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=True
         )
-        assert ok is True
-        assert errors == []
-        assert any("aws_s3_bucket.assets" in w for w in warnings)
+        assert result.ok is True
+        assert result.errors == []
+        assert any("aws_s3_bucket.assets" in w for w in result.warnings)
 
     @pytest.mark.parametrize(
         "actions", [["delete"], ["forget"], ["delete", "create"], ["create", "delete"]]
@@ -742,11 +742,11 @@ class TestVerifyImportPlan:
                 "aws_s3_bucket.logs", actions, before={"bucket": "s3-acme-dev-logs"}, after=None
             )
         ]
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             changes, me=merge_me, knowledge=knowledge, allow_import_updates=True
         )
-        assert ok is False
-        assert any("aws_s3_bucket.logs" in e for e in errors)
+        assert result.ok is False
+        assert any("aws_s3_bucket.logs" in e for e in result.errors)
 
     def test_unknown_type_strict_noop(self, make_overlay, make_claim, knowledge) -> None:
         me = make_overlay(
@@ -756,13 +756,13 @@ class TestVerifyImportPlan:
                 )
             }
         )
-        ok, _, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             [importing_noop("acme_widget.w", "w-1", {"id": "w-1", "name": "w"})],
             me=me,
             knowledge=knowledge,
             allow_import_updates=False,
         )
-        assert ok is True
+        assert result.ok is True
         changed = mk_change(
             "acme_widget.w",
             ["update"],
@@ -770,10 +770,131 @@ class TestVerifyImportPlan:
             after={"id": "w-1", "force": True},
             importing={"id": "w-1"},
         )
-        ok, errors, _ = plan.verify_import_plan(
+        result = plan.verify_import_plan(
             [changed], me=me, knowledge=knowledge, allow_import_updates=False
         )
-        assert ok is False
+        assert result.ok is False
+
+
+    # -- trunk drift (DESIGN 8: classified like `plan` does, DESIGN 7.8) ------- #
+
+    def _foreign_update(self, address: str = "aws_s3_bucket.assets") -> list[ResourceChange]:
+        changes = self.base_changes()
+        changes[2] = mk_change(
+            address, ["update"], before={"tags": {}}, after={"tags": {"env": "dev"}}
+        )
+        return changes
+
+    def test_trunk_drift_update_is_tolerated_with_one_summary_warning(
+        self, merge_me, knowledge
+    ) -> None:
+        changes = self._foreign_update()
+        result = plan.verify_import_plan(
+            changes,
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=False,
+            trunk_drift={"aws_s3_bucket.assets": ["update"]},
+        )
+        assert result.ok is True, result.errors
+        assert result.drift == ["aws_s3_bucket.assets"]
+        assert result.warnings == [
+            "1 base resource(s) differ because the trunk is not applied on this base "
+            "(aws_s3_bucket.assets): tolerated, a trunk plan produces them too"
+        ]
+
+    def test_several_drift_updates_share_one_warning(self, merge_me, knowledge) -> None:
+        changes = self._foreign_update() + [
+            mk_change(
+                "aws_s3_bucket.logs", ["update"], before={"tags": {}}, after={"tags": {"a": "b"}}
+            )
+        ]
+        baseline = {"aws_s3_bucket.assets": ["update"], "aws_s3_bucket.logs": ["update"]}
+        result = plan.verify_import_plan(
+            changes,
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=False,
+            trunk_drift=baseline,
+        )
+        assert result.ok is True, result.errors
+        assert result.drift == ["aws_s3_bucket.assets", "aws_s3_bucket.logs"]
+        assert len(result.warnings) == 1
+        assert result.warnings[0].startswith("2 base resource(s) differ")
+
+    def test_update_outside_the_baseline_is_still_an_error(self, merge_me, knowledge) -> None:
+        result = plan.verify_import_plan(
+            self._foreign_update(),
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=False,
+            trunk_drift={"aws_s3_bucket.logs": ["update"]},
+        )
+        assert result.ok is False
+        assert result.drift == []
+        assert result.errors == ["aws_s3_bucket.assets: update outside the overlay's claims"]
+
+    def test_allow_import_updates_still_downgrades_a_foreign_update(
+        self, merge_me, knowledge
+    ) -> None:
+        result = plan.verify_import_plan(
+            self._foreign_update(),
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=True,
+            trunk_drift={"aws_s3_bucket.logs": ["update"]},
+        )
+        assert result.ok is True
+        assert result.drift == []
+        assert any("aws_s3_bucket.assets" in w for w in result.warnings)
+
+    def test_a_claimed_update_in_the_baseline_stays_claimed(self, merge_me, knowledge) -> None:
+        """The branch owns that update: it is neither drift nor a warning."""
+        changes = self.base_changes() + [
+            mk_change(
+                "aws_iam_role.app",
+                ["update"],
+                before={"description": "a"},
+                after={"description": "b"},
+            )
+        ]
+        result = plan.verify_import_plan(
+            changes,
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=False,
+            trunk_drift={"aws_iam_role.app": ["update"]},
+        )
+        assert result.ok is True, result.errors
+        assert result.drift == []
+        assert result.warnings == []
+
+    def test_no_baseline_keeps_the_strict_rule(self, merge_me, knowledge) -> None:
+        for baseline in (None, {}):
+            result = plan.verify_import_plan(
+                self._foreign_update(),
+                me=merge_me,
+                knowledge=knowledge,
+                allow_import_updates=False,
+                trunk_drift=baseline,
+            )
+            assert result.ok is False
+            assert result.drift == []
+            assert any("aws_s3_bucket.assets" in e for e in result.errors)
+
+    def test_drift_does_not_excuse_a_destructive_change(self, merge_me, knowledge) -> None:
+        changes = self.base_changes() + [
+            mk_change("aws_s3_bucket.logs", ["delete"], before={"bucket": "s3-acme-dev-logs"})
+        ]
+        result = plan.verify_import_plan(
+            changes,
+            me=merge_me,
+            knowledge=knowledge,
+            allow_import_updates=False,
+            trunk_drift={"aws_s3_bucket.logs": ["delete"]},
+        )
+        assert result.ok is False
+        assert any("aws_s3_bucket.logs" in e for e in result.errors)
 
 
 class TestGuardTrunkPlan:

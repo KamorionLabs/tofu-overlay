@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Changed
+
+- `merge` verification (DESIGN §8) now classifies base updates like `plan`
+  does (§7.8): an `update` outside the overlay's claims that the trunk
+  baseline also carries is trunk drift, not a verification failure. Those
+  addresses are listed in the new `VerifyResult.drift`, share one summary
+  warning ("N base resource(s) differ because the trunk is not applied on
+  this base (…)") and are reported by `merge` as `trunk drift tolerated: N
+  address(es)`; updates the baseline does not carry still block the merge
+  unless `--allow-import-updates`, and destructive actions stay refused.
+  `MergeService.verify` passes `OverlayService.trunk_baseline()` (the same
+  cache as `plan`, no extra tofu run when it is already computed) and warns
+  that the baseline is unavailable when it cannot be computed, keeping the
+  previous stricter rule. On a base the trunk pipeline has not applied,
+  `merge` no longer needs `--allow-import-updates` (which downgraded every
+  unexpected update, drift and surprises alike).
+  `plan.verify_import_plan` takes `trunk_drift=` and returns a
+  `VerifyResult` (`errors`, `warnings`, `drift`, `.ok`) instead of
+  `(ok, errors, warnings)`; `MergeService.verify` returns it too, and `plan`
+  in verify mode reports those addresses as `drift`.
+
 ### Added
 
 - `apply --only-claims` (DESIGN §7.9): when the plan carries trunk drift or

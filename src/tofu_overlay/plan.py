@@ -23,6 +23,7 @@ from tofu_overlay.models import (
     PolicyResult,
     RegistryDoc,
     ResourceChange,
+    VerifyResult,
     Violation,
     utcnow_iso,
 )
@@ -557,15 +558,26 @@ def verify_import_plan(
     knowledge: TypeKnowledge,
     allow_import_updates: bool,
     accepted_recreate: set[str] | None = None,
-) -> tuple[bool, list[str], list[str]]:
+    trunk_drift: dict[str, list[str]] | None = None,
+) -> VerifyResult:
     """DESIGN §8: verify the branch config planned against the base state.
 
     ``accepted_recreate`` lists the create claims left out of the imports file
     (``merge --accept-recreate``): they must plan as a plain ``create``.
-    Returns ``(ok, errors, warnings)``.
+
+    ``trunk_drift`` is the trunk baseline (address -> actions of a plan of the
+    trunk config against the base state), the same document ``evaluate`` uses
+    for §7.8. An ``update`` on an address that is in the baseline and is not
+    one of the overlay's claims is **trunk drift**: the base lags the trunk and
+    a trunk plan produces that update too, so it is not the branch's doing and
+    does not block the merge. It is listed in ``VerifyResult.drift`` and
+    summarised in a single warning. Any other update outside the claims stays
+    an error unless ``allow_import_updates``. ``None`` means "no baseline
+    available": nothing is tolerated as drift.
     """
     errors: list[str] = []
     warnings: list[str] = []
+    drift: list[str] = []
     accepted = set(accepted_recreate or ())
     by_address = {c.address: c for c in changes if not c.deposed}
     creates = me.create_claims()
@@ -591,8 +603,11 @@ def verify_import_plan(
         if actions == _UPDATE and change.address in updates and not change.replace_paths:
             continue
         if actions == _UPDATE and not change.replace_paths:
-            msg = f"{change.address}: update outside the overlay's claims"
-            (warnings if allow_import_updates else errors).append(msg)
+            if trunk_drift is not None and change.address in trunk_drift:
+                drift.append(change.address)
+            else:
+                msg = f"{change.address}: update outside the overlay's claims"
+                (warnings if allow_import_updates else errors).append(msg)
         elif actions == _CREATE:
             warnings.append(f"{change.address}: created by the trunk (not applied in the overlay)")
         elif change.importing:
@@ -600,7 +615,12 @@ def verify_import_plan(
         else:
             errors.append(f"{change.address}: {list(actions)} is not allowed in a merge plan")
 
-    return (not errors, errors, warnings)
+    if drift:
+        warnings.append(
+            f"{len(drift)} base resource(s) differ because the trunk is not applied on this "
+            f"base ({', '.join(sorted(drift))}): tolerated, a trunk plan produces them too"
+        )
+    return VerifyResult(errors=errors, warnings=warnings, drift=sorted(drift))
 
 
 # ---------------------------------------------------------------- trunk guard

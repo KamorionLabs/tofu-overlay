@@ -1071,12 +1071,14 @@ class OverlayService:
 
         self.console.info(f"overlay '{ov.name}' is merging: running verify mode")
         stale, _ = self._freshness(ov)
-        ok, errors, warnings = MergeService(self).verify()
+        result = MergeService(self).verify()
         violations = [
             Violation(address="", rule="merge-verify", message=e, other_overlay=None)
-            for e in errors
+            for e in result.errors
         ]
-        policy = PolicyResult(violations=violations, warnings=warnings, claims={})
+        policy = PolicyResult(
+            violations=violations, warnings=result.warnings, claims={}, drift=result.drift
+        )
         planfile = self.base_data_dir / "tfplan.verify"
         summary = PlanSummary()
         self._report_policy(policy, summary)

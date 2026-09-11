@@ -421,6 +421,26 @@ class PolicyResult(BaseModel):
         return not self.violations
 
 
+class VerifyResult(BaseModel):
+    """Outcome of the merge verification of a branch plan (DESIGN §8).
+
+    ``errors`` block the merge, ``warnings`` do not. ``drift`` lists base
+    addresses whose ``update`` a plan of the trunk config against the base
+    state produces too (the trunk is not applied on this base): tolerated,
+    neither an error nor a claim, exactly as ``PolicyResult.drift`` on a
+    ``plan``.
+    """
+
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    drift: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing blocks the merge."""
+        return not self.errors
+
+
 class Finding(BaseModel):
     """A ``doctor``/``gc`` finding: ``level`` is ``info``, ``warning`` or ``error``."""
 

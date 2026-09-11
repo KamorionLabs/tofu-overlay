@@ -53,7 +53,8 @@ branch. Three mechanisms cooperate:
    the trunk through a generated `zz_overlay_<name>.imports.tf` file
    (`import {}` blocks) committed with the branch. The file is verified with a
    plan of the branch config against the base state: every created resource
-   must import as a no-op. Once the trunk pipeline has applied the imports,
+   must import as a no-op (base updates the trunk itself would produce are
+   tolerated as trunk drift, like on a `plan`). Once the trunk pipeline has applied the imports,
    `finalize` archives the overlay state and releases the claims. `abandon`
    destroys only the overlay's own resources.
 
@@ -122,7 +123,7 @@ lock table). Read-only commands never write anything, registry included.
 | `list [--json]` | none | Same data as `status`, one line per overlay. `--bucket B --prefix P` scans registries without a checkout. |
 | `check [--json] [--repo]` | none | CI gate: overlay exists for the branch (else "no overlay", exit 0), fresh, branch contains trunk, claims match the overlay state, no conflicting overlay, imports file matches the claims; warns about trunk drift. |
 | `rebase` | overlay key, registry | Re-fork on the current base while keeping the overlay's own resources. Typed confirmation; the previous overlay state is archived. |
-| `merge [--undo] [--allow-import-updates] [--accept-recreate ADDR,...] [--allow-unapplied]` | imports file, registry | Write and verify `zz_overlay_<name>.imports.tf`, status `merging`. `--undo` deletes the file and returns to `active`. |
+| `merge [--undo] [--allow-import-updates] [--accept-recreate ADDR,...] [--allow-unapplied]` | imports file, registry | Write and verify `zz_overlay_<name>.imports.tf`, status `merging`. The verification tolerates base updates the trunk baseline also carries (`trunk drift tolerated: N address(es)`), like `plan`; any other update outside the claims blocks it unless `--allow-import-updates`. `--undo` deletes the file and returns to `active`. |
 | `finalize [--purge]` | S3 archive/delete, DynamoDB, registry | After the trunk applied the imports: verify every created resource is in the base with the same id, archive the overlay key, release claims. Prints the `git rm` to run. |
 | `abandon [--keep-resources] [--dry-run]` | overlay key, S3 archive/delete, DynamoDB, registry | Destroy the overlay's own resources (base resources are removed from the overlay state first so they can never be destroyed), archive, release claims, record pending reverts for `update` claims. |
 | `doctor` | none | Report orphan overlay objects, missing keys, orphan `-md5` items and `.tflock`s, stale `applying`, tombstones, git-ignore, binary version, leftover imports files. |
@@ -205,7 +206,9 @@ sections 13 and 14):
   exactly the claim set and gated again (drift and ignored updates stay
   unapplied and are reported again on the next plan; a dependency pulled in
   with drift refuses with exit 3). `--json` on `apply` then carries
-  `only_claims` and `targets`; see [docs/LIMITS.md](docs/LIMITS.md) §15;
+  `only_claims` and `targets`; see [docs/LIMITS.md](docs/LIMITS.md) §15. The
+  `merge` verification uses the same baseline and tolerates those updates
+  too, so a base lagging the trunk does not force `--allow-import-updates`;
 - **environment-dependent attributes** (`aws_lambda_function.filename`
   under another `TF_DATA_DIR`, `last_modified`...): listed as `ignored`,
   not claimed, still applied by tofu. Extend the list with

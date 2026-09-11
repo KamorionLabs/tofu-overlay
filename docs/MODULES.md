@@ -29,6 +29,8 @@ class Violation(BaseModel): address:str; rule:str; message:str; other_overlay:st
 class RemoteStateRef(BaseModel): name:str; bucket:str|None; key:str|None; region:str|None; unresolved:bool=False   # one data "terraform_remote_state" (s3) block; unresolved -> key None
 class PolicyResult(BaseModel): violations:list[Violation]; warnings:list[str]; claims:dict[str,Claim]; drift:list[str]=[]; ignored:list[str]=[]  # claims to acquire on apply; drift = base updates classified as trunk drift (not claimed, DESIGN §7.8); ignored = base updates touching only environment-dependent attributes (not claimed, §7.7)
     # ok -> bool
+class VerifyResult(BaseModel): errors:list[str]=[]; warnings:list[str]=[]; drift:list[str]=[]  # merge verification (DESIGN §8); drift = updates outside the claims the trunk baseline also carries (tolerated, not errors)
+    # ok -> bool (no error)
 class BackendInfo / misc small models as needed.
 def utcnow_iso() -> str
 def new_run_id() -> str  (uuid4 hex[:12])
@@ -214,7 +216,8 @@ def evaluate(changes: list[ResourceChange], drift: list[dict], *, base_addresses
     # existing own claims are kept; an update on an address already claimed by me is fine (and never drift)
     # per base update, in this order: differing attributes all in knowledge.ignored_attrs(type) -> PolicyResult.ignored, no claim; address in trunk_drift -> PolicyResult.drift, no claim; else update claim. One warning per non-empty list. trunk_drift None = no baseline, nothing is drift. delete/replace on base addresses stay denied
 def gate_targeted_plan(changes: list[ResourceChange], targeted: PolicyResult, *, me: Overlay, full_claims: dict[str, Claim]) -> tuple[dict[str, Claim], list[str]]   # DESIGN §7.9: (claims to acquire, warnings for full-plan claims the targeted plan left out); PolicyError on violations, on targeted.drift ("carry trunk drift; apply the trunk first or use --accept-drift") and on any non-no-op managed address outside full_claims | me.claims | targeted.ignored
-def verify_import_plan(changes: list[ResourceChange], *, me: Overlay, knowledge: TypeKnowledge, allow_import_updates: bool, accepted_recreate: set[str]|None = None) -> tuple[bool, list[str], list[str]]   # DESIGN §8: (ok, errors, warnings)
+def verify_import_plan(changes: list[ResourceChange], *, me: Overlay, knowledge: TypeKnowledge, allow_import_updates: bool, accepted_recreate: set[str]|None = None, trunk_drift: dict[str, list[str]]|None = None) -> VerifyResult   # DESIGN §8: VerifyResult(errors, warnings, drift, .ok)
+    # an update outside the claims that is in trunk_drift -> VerifyResult.drift, not an error, one summary warning for all of them; any other update outside the claims -> error unless allow_import_updates; trunk_drift None = no baseline, strict. delete/replace stay errors
 def guard_trunk_plan(changes: list[ResourceChange], *, doc: RegistryDoc, knowledge: TypeKnowledge, overlay_states: dict[str, dict] | None) -> list[Violation]   # DESIGN §6 guard
 def render_summary(summary: PlanSummary) -> str
 ```
@@ -267,7 +270,7 @@ class MergeService:                                        # reaches the store o
     def __init__(self, svc: OverlayService)
     def merge(self, *, allow_import_updates: bool, accept_recreate: list[str], allow_unapplied: bool, yes: bool) -> Path
     def undo(self, *, yes: bool) -> None
-    def verify(self, *, accepted: set[str]|None = None) -> tuple[bool, list[str], list[str]]    # plan branch config against base state in base data dir, then plan.verify_import_plan; accepted defaults to the create claims absent from the imports file
+    def verify(self, *, accepted: set[str]|None = None) -> VerifyResult    # plan branch config against base state in base data dir, then plan.verify_import_plan with svc.trunk_baseline() (same cache as `plan`; None + warning when unavailable -> strict); accepted defaults to the create claims absent from the imports file
 def guard(plan_json_path: Path, *, registry: Registry, knowledge: TypeKnowledge) -> list[Violation]
 ```
 

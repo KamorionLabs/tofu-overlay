@@ -142,8 +142,9 @@ The verify plan runs the **branch config** against the **base state** in the bas
 
 - every `create` claim address must have `importing` set, and `actions == ["no-op"]`, or `actions == ["update"]` with empty `replace_paths` and every differing attribute in `virtual_attributes[type]` (write-only attributes such as `aws_lambda_function.filename`/`source_code_hash`, `force_destroy`, `deletion_window_in_days`, `skip_final_snapshot`, `helm_release.values`) — otherwise it is a hard failure with the offenders listed;
 - addresses under an `update` claim may show `update` (that is the branch's change);
+- an `update` outside the claims that the **trunk baseline** (§7.8) also reports is **trunk drift**: the base lags the trunk and a trunk plan would produce that update too, so it is not the branch's doing. No failure: the address is listed in `VerifyResult.drift` and the addresses share one warning ("N base resource(s) differ because the trunk is not applied on this base (…): tolerated, a trunk plan produces them too"); `merge` prints `trunk drift tolerated: N address(es)`. The baseline is the same cached document `plan` uses (`_base/trunk_baseline.json`, keyed by trunk sha and base ETag), so the verification classifies base updates exactly as `plan` does — on a base the trunk pipeline has not applied, `merge` no longer needs `--allow-import-updates`. When the baseline is unavailable (§7.8: `origin/<trunk>` unknown, export or env dir missing, baseline plan failing) the stricter rule below applies to every update and a warning says the baseline is unavailable;
 - any other `update` → failure unless `--allow-import-updates` (then a warning);
-- any `delete`, replace, `forget` → failure;
+- any `delete`, replace, `forget` → failure, whatever the baseline says;
 - `replace_prone` types (e.g. `aws_lambda_layer_version`) and `non_importable` types are refused up-front (§6 `merge`).
 
 `import { to = ADDRESS  id = "IMPORT_ID" }` blocks use `import_ids.yaml` formats (identity-based imports are a later option). Types absent from the file default to `{id}` with a warning and strict no-op verification.

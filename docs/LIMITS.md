@@ -241,6 +241,20 @@ environment) followed by `rebase`; `apply --accept-drift` (with `--yes` in
 CI) claims the drifted addresses as regular updates when the branch really
 owns that change.
 
+`merge` reasons on the same baseline (the same cached document, so a `merge`
+after a `plan` runs no extra trunk plan) and therefore classifies base
+updates exactly as `plan` does: an `update` outside the overlay's claims that
+the baseline also carries is drift, not a verification failure — it is
+reported as `trunk drift tolerated: N address(es)` plus one summary warning,
+and the merge proceeds. Without that consistency, every repository whose
+trunk is not applied on the environment had to pass
+`--allow-import-updates`, which downgrades *every* unexpected update to a
+warning, drift and genuine surprises alike. Updates the baseline does not
+carry still block the merge (`--allow-import-updates` remains the deliberate
+escape hatch), and destructive actions stay refused whatever the baseline
+says. When the baseline is unavailable the verification keeps the stricter
+rule and says so.
+
 Caveats:
 
 - the baseline is only computed when the overlay plan holds a new `update`
